@@ -760,3 +760,15 @@ def test_cached_sections_served_without_new_fetches(make_server) -> None:
         payload = _tool_payload(_tool_call(server, "get_call", {"call_id": "500"}))
         assert payload["transcript"]["available"] is True
     assert len(client._transport.requests) == 3
+
+
+def test_recording_section_dedupes_repeated_urls():
+    url = "https://dialpad.com/blob/adminrecording/abc"
+    section = team_calls.recording_section(
+        {
+            "recording_details": [{"url": url, "recording_type": "admincallrecording"}],
+            "admin_recording_urls": [url],
+            "voicemail_link": url,
+        }
+    )
+    assert [entry["url"] for entry in section["urls"]] == [url]

@@ -501,16 +501,19 @@ def recording_section(call: Mapping[str, Any]) -> dict[str, Any]:
                 "start_time": _iso_ms(detail.get("start_time")),
             }
         )
+    seen = {entry["url"] for entry in urls}
     admin_urls = call.get("admin_recording_urls")
     for url in admin_urls if isinstance(admin_urls, list) else []:
         url = _first_str(url)
-        if url:
+        if url and url not in seen:
+            seen.add(url)
             urls.append(
                 {"type": "admincallrecording", "url": url, "duration_seconds": None, "start_time": None}
             )
     for key in ("voicemail_link", "voicemail_share_link"):
         url = _first_str(call.get(key))
-        if url:
+        if url and url not in seen:
+            seen.add(url)
             urls.append({"type": "voicemail", "url": url, "duration_seconds": None, "start_time": None})
     section: dict[str, Any] = {"available": bool(urls), "urls": urls, "note": RECORDING_URL_NOTE}
     if not urls:

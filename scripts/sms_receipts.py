@@ -38,8 +38,34 @@ FAILED_DELIVERY_RESULTS = {
 AppendReceiptStatus = Literal["appended", "not_applicable", "append_failed"]
 
 
-def _ledger_path() -> Path:
-    return Path(os.environ.get("DIALPAD_SMS_RECEIPT_LEDGER", str(DEFAULT_LEDGER_PATH)))
+def _xdg_ledger_path() -> Path:
+    base = os.environ.get("XDG_STATE_HOME", "").strip()
+    root = Path(base).expanduser() if base else Path.home() / ".local" / "state"
+    return root / "dialpad" / "sms-receipts.jsonl"
+
+
+def _dir_usable(path: Path) -> bool:
+    try:
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    except OSError:
+        return False
+    return os.access(path, os.W_OK | os.X_OK)
+
+
+def _candidate_ledger_paths() -> list[Path]:
+    override = os.environ.get("DIALPAD_SMS_RECEIPT_LEDGER", "").strip()
+    if override:
+        # An explicit override names the ledger; a failed write reports
+        # append_failed rather than writing somewhere the operator did not ask.
+        return [Path(override).expanduser()]
+    # Gateway deployments keep the legacy /data path whenever it is usable;
+    # everywhere else the XDG state dir is the candidate. If the legacy path
+    # fails with OSError at append time the XDG path is tried once.
+    candidates = [DEFAULT_LEDGER_PATH] if _dir_usable(DEFAULT_LEDGER_PATH.parent) else []
+    xdg = _xdg_ledger_path()
+    if xdg not in candidates:
+        candidates.append(xdg)
+    return candidates
 
 
 def extract_send_result(result: Any) -> tuple[str | None, str | None]:
@@ -141,9 +167,19 @@ def append_receipt(
             if value is not None:
                 payload[key] = value
 
-        _append_jsonl(_ledger_path(), payload)
+        last_error: OSError | None = None
+        for path in _candidate_ledger_paths():
+            try:
+                _append_jsonl(path, payload)
+            except OSError as exc:
+                last_error = exc
+                continue
+            return "appended"
+        if last_error is not None:
+            print(f"Warning: failed to append Dialpad SMS receipt ledger: {last_error}", file=sys.stderr)
+            return "append_failed"
     except Exception as exc:  # noqa: BLE001 - receipt persistence is observational only.
         print(f"Warning: failed to append Dialpad SMS receipt ledger: {exc}", file=sys.stderr)
         return "append_failed"
 
-    return "appended"
+    return "append_failed"

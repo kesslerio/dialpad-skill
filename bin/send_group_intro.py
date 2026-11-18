@@ -268,6 +268,11 @@ def main() -> int:
             return handle_wrapper_exception(command, wrapper, err, True)
         print_wrapper_error(err)
         return 2
+    except Exception as err:  # noqa: BLE001 - wrappers must return structured JSON in --json mode.
+        if json_mode:
+            return handle_wrapper_exception(command, wrapper, err, True)
+        print_wrapper_error(err)
+        return 2
 
 
 if __name__ == "__main__":

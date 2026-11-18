@@ -156,7 +156,7 @@ def _run() -> int:
                 "until_ms": started_before,
             }
             try:
-                shared_data, _remote_meta = get_data("/v1/calls", query=query)
+                shared_data, _remote_meta = get_data("/v1/calls", query=query, required_lists=("calls",))
             except LogApiError as exc:
                 # Shared log auth drift should not brick call history — fall back to live Dialpad.
                 if (
@@ -173,7 +173,12 @@ def _run() -> int:
                         raise WrapperError(str(live_exc)) from live_exc
                     rows = None  # filled below via to_row path
                 else:
-                    raise WrapperError(str(exc), code=exc.code, retryable=exc.retryable) from exc
+                    raise WrapperError(
+                        str(exc),
+                        code=exc.code,
+                        retryable=exc.retryable,
+                        retry_after_seconds=exc.retry_after,
+                    ) from exc
             else:
                 raw_calls = shared_data.get("calls") if isinstance(shared_data.get("calls"), list) else []
                 raw_calls = [call for call in raw_calls if isinstance(call, dict)]
@@ -287,6 +292,11 @@ def _run() -> int:
         print(render_table(rows))
         return 0
     except WrapperError as err:
+        if json_mode:
+            return handle_wrapper_exception(command, wrapper, err, True)
+        print_wrapper_error(err)
+        return 2
+    except Exception as err:  # noqa: BLE001 - wrappers must return structured JSON in --json mode.
         if json_mode:
             return handle_wrapper_exception(command, wrapper, err, True)
         print_wrapper_error(err)

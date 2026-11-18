@@ -78,9 +78,15 @@ def _run() -> int:
                 data, _remote_meta = get_data(
                     "/v1/sms/inbox",
                     query={"limit": limit, "unread_only": str(args.unread_only).lower()},
+                    required_lists=("messages",),
                 )
             except LogApiError as exc:
-                raise WrapperError(str(exc), code=exc.code, retryable=exc.retryable) from exc
+                raise WrapperError(
+                    str(exc),
+                    code=exc.code,
+                    retryable=exc.retryable,
+                    retry_after_seconds=exc.retry_after,
+                ) from exc
             history_source = "shared_log"
         else:
             try:

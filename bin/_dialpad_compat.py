@@ -29,6 +29,7 @@ if str(BIN_DIR) not in sys.path:
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.append(str(SCRIPTS_DIR))
 
+import http_retry  # noqa: E402 - needs SCRIPTS_DIR on sys.path
 import sms_receipts  # noqa: E402 - needs SCRIPTS_DIR on sys.path; module-top import so a broken deploy fails before any send, never after one
 
 
@@ -116,8 +117,11 @@ ERROR_CODES = {
     "timeout",
     "partial_success",
     "send_gate_refused",
+    "send_outcome_unknown",
     "internal_error",
 }
+SEND_OUTCOME_UNKNOWN_MESSAGE = "send outcome unknown; check the thread before resending"
+REQUEST_OUTCOME_UNKNOWN_MESSAGE = "request outcome unknown; verify before repeating"
 E164_RE = re.compile(r"^\+\d{7,15}$")
 _RECEIPT_SOURCE: str | None = None
 _RECEIPT_STATUS: str | None = None
@@ -134,11 +138,13 @@ class WrapperError(Exception):
         code: str | None = None,
         retryable: bool | None = None,
         meta: dict[str, object] | None = None,
+        retry_after_seconds: float | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.retryable = retryable
         self.meta = meta or {}
+        self.retry_after_seconds = retry_after_seconds
 
 
 class WrapperArgumentParser(argparse.ArgumentParser):
@@ -295,8 +301,25 @@ def run_generated(args: list[str], capture_output: bool = False) -> subprocess.C
 
 
 
+_READ_VERBS = {"get", "list", "lookup"}
+
+
 def _is_sms_send_command(args: list[str]) -> bool:
     return len(args) >= 4 and args[0:2] == ["sms", "send"] and "--data" in args
+
+
+def _is_read_command(args: list[str]) -> bool:
+    """Whether the generated command is an idempotent read.
+
+    Generated args are ``<group> <operation> [flags]``; reads are the
+    ``*get``/``*list`` verbs (plus the ``contact lookup`` alias form) and carry
+    no ``--data`` body. Every other verb — sends, call placement, creates,
+    updates, deletes — is a non-idempotent write under the SAFE-RETRY rule, so
+    an unrecognized verb fails safe in the no-blind-retry direction.
+    """
+    if len(args) < 2 or "--data" in args:
+        return False
+    return args[1].rsplit(".", 1)[-1] in _READ_VERBS
 
 
 def _sms_send_payload(args: list[str]) -> dict[str, object] | None:
@@ -377,10 +400,45 @@ def is_missing_dependency_error(text: str) -> bool:
     )
 
 
-def run_generated_json(args: list[str]) -> Any:
+class _RetryableGeneratedError(Exception):
+    """One transient generated-CLI failure inside the run_generated_json loop."""
+
+    def __init__(self, message: str, *, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.message = message
+        self.retry_after = retry_after
+
+
+def _generated_retry_decision(exc: BaseException) -> http_retry.RetryDecision | None:
+    if isinstance(exc, _RetryableGeneratedError):
+        return http_retry.RetryDecision(retry_after=exc.retry_after)
+    return None
+
+
+def run_generated_json(
+    args: list[str],
+    *,
+    sleep: Any = None,
+    random_fn: Any = None,
+) -> Any:
+    """Run the generated CLI and return its parsed JSON stdout.
+
+    Retry rule: a generated command that carries a request body or runs a
+    write verb is not idempotent, so it retries only when the failure
+    provably left no accepted request (see http_retry's SAFE-RETRY comment);
+    idempotent reads may retry on any transient failure. Attempts are
+    bounded by http_retry's shared policy.
+    """
     cmd = ["--output", "json", *args]
-    proc = run_generated(cmd, capture_output=True)
-    if proc.returncode != 0:
+    is_read = _is_read_command(args)
+    outcome_unknown_message = (
+        SEND_OUTCOME_UNKNOWN_MESSAGE if _is_sms_send_command(args) else REQUEST_OUTCOME_UNKNOWN_MESSAGE
+    )
+
+    def _attempt() -> subprocess.CompletedProcess[str]:
+        proc = run_generated(cmd, capture_output=True)
+        if proc.returncode == 0:
+            return proc
         message = proc.stderr.strip() or proc.stdout.strip() or "generated command failed"
         if is_missing_dependency_error(message):
             raise WrapperError(
@@ -388,7 +446,37 @@ def run_generated_json(args: list[str]) -> Any:
                 code="missing_generated_cli",
                 retryable=False,
             )
+        retry_after = http_retry.retry_after_in_text(message)
+        if not is_read:
+            classification = http_retry.classify_request_stderr(message)
+            if classification == http_retry.SAFE_RETRY:
+                raise _RetryableGeneratedError(message, retry_after=retry_after)
+            if classification == http_retry.PERMANENT:
+                raise WrapperError(message, code="upstream_error", retryable=False)
+            raise WrapperError(
+                f"{outcome_unknown_message}: {message}",
+                code="send_outcome_unknown",
+                retryable=False,
+            )
+        if http_retry.stderr_is_transient(message):
+            raise _RetryableGeneratedError(message, retry_after=retry_after)
         raise WrapperError(message, code="upstream_error", retryable=True)
+
+    try:
+        proc = http_retry.run(
+            _attempt,
+            retry_decision=_generated_retry_decision,
+            budget_seconds=None,
+            sleep=sleep,
+            random_fn=random_fn,
+        )
+    except _RetryableGeneratedError as exc:
+        raise WrapperError(
+            exc.message,
+            code="upstream_error",
+            retryable=True,
+            retry_after_seconds=exc.retry_after,
+        ) from exc
 
     try:
         result = json.loads(proc.stdout)
@@ -441,18 +529,22 @@ def emit_error(
     message: str,
     retryable: bool,
     meta_extra: dict[str, object] | None = None,
+    retry_after_seconds: float | None = None,
 ) -> None:
     resolved_code = code if code in ERROR_CODES else "internal_error"
+    error: dict[str, object] = {
+        "code": resolved_code,
+        "message": message,
+        "retryable": retryable,
+    }
+    if retry_after_seconds is not None:
+        error["retry_after_seconds"] = retry_after_seconds
     print(
         json.dumps(
             {
                 "ok": False,
                 "command": command,
-                "error": {
-                    "code": resolved_code,
-                    "message": message,
-                    "retryable": retryable,
-                },
+                "error": error,
                 "meta": build_meta(wrapper, meta_extra),
             },
             indent=2,
@@ -504,7 +596,15 @@ def handle_wrapper_exception(command: str, wrapper: str, err: Exception, json_mo
         else:
             code, retryable = classify_wrapper_error(str(err))
             meta_extra = err.meta if isinstance(err, WrapperError) else None
-        emit_error(command, wrapper, code, str(err), retryable, meta_extra=meta_extra)
+        emit_error(
+            command,
+            wrapper,
+            code,
+            str(err),
+            retryable,
+            meta_extra=meta_extra,
+            retry_after_seconds=getattr(err, "retry_after_seconds", None),
+        )
         return 2
 
     print_wrapper_error(err)

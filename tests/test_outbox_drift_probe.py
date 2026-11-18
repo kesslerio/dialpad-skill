@@ -125,13 +125,19 @@ def test_the_shipped_manifest_names_files_that_exist_in_this_repo() -> None:
 
 
 def test_the_shipped_manifest_covers_every_runtime_file_this_change_touched() -> None:
-    """U1-U4 changed five runtime files; the manifest must name exactly those."""
+    """The manifest must name exactly the reviewed runtime set."""
     root = Path(__file__).resolve().parent.parent
     from outbox_drift_probe import _read_manifest
 
     assert set(_read_manifest(root / "references/outbox-runtime-files.txt")) == {
         "scripts/log_outbox.py",
+        "scripts/log_api_client.py",
+        "scripts/http_retry.py",
+        "scripts/sms_receipts.py",
+        "scripts/send_sms.py",
+        "bin/_dialpad_compat.py",
         "bin/send_sms.py",
+        "bin/send_sms_at.py",
         "bin/list_sms_inbox.py",
         "bin/list_sms_thread.py",
         "bin/list_calls.py",

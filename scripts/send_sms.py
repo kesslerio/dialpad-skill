@@ -15,6 +15,7 @@ import sys
 import urllib.request
 import urllib.error
 
+import http_retry
 import send_gate
 import sms_receipts
 from outbound_destination_policy import normalize_supported_outbound_destinations
@@ -24,9 +25,27 @@ from log_outbox import record_outbound_observation
 # Configuration
 DIALPAD_API_KEY = os.environ.get("DIALPAD_API_KEY")
 DIALPAD_API_BASE = "https://dialpad.com/api/v2"
+DIALPAD_SEND_TIMEOUT = 30
 
 
-def send_sms(to_numbers, message, from_number=None, infer_country_code=False):
+class SendOutcomeUnknownError(RuntimeError):
+    """The send request may have been accepted; the result is not known.
+
+    Raised only for failures after request bytes could have left the client —
+    read timeouts, connection resets, and 5xx responses — where Dialpad may
+    have queued the message. Callers must check the thread before resending.
+    """
+
+
+class _SafeRetrySendError(RuntimeError):
+    """A send failure provably before acceptance, retried inside send_sms."""
+
+    def __init__(self, message, *, retry_after=None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+def send_sms(to_numbers, message, from_number=None, infer_country_code=False, *, _sleep=None, _random_fn=None):
     """
     Send SMS via Dialpad API.
 
@@ -74,20 +93,54 @@ def send_sms(to_numbers, message, from_number=None, infer_country_code=False):
 
     request = urllib.request.Request(url, data=data, headers=headers, method="POST")
 
-    try:
-        with urllib.request.urlopen(request) as response:
-            response_data = response.read().decode("utf-8")
-            return json.loads(response_data)
-    except urllib.error.HTTPError as e:
-        error_body = e.read().decode("utf-8") if e.fp else ""
+    def _attempt():
+        # SAFE-RETRY: retrying a send that may have been accepted can deliver a
+        # duplicate, so only failures provably before acceptance are retried —
+        # HTTP 429 rejections and connection-stage errors. Timeouts, resets,
+        # and 5xx raise SendOutcomeUnknownError instead; other HTTP errors are
+        # permanent rejections. See http_retry for the shared rule.
         try:
-            error_data = json.loads(error_body)
-            error_msg = error_data.get("error", {}).get("message", error_body)
-        except:
-            error_msg = error_body or str(e)
-        raise RuntimeError(f"Dialpad API error (HTTP {e.code}): {error_msg}")
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"Network error: {e.reason}")
+            with urllib.request.urlopen(request, timeout=DIALPAD_SEND_TIMEOUT) as response:
+                response_data = response.read().decode("utf-8")
+                return json.loads(response_data)
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode("utf-8") if e.fp else ""
+            try:
+                error_data = json.loads(error_body)
+                error_msg = error_data.get("error", {}).get("message", error_body)
+            except Exception:
+                error_msg = error_body or str(e)
+            if e.code == 429:
+                raise _SafeRetrySendError(
+                    f"Dialpad API error (HTTP {e.code}): {error_msg}",
+                    retry_after=http_retry.retry_after_from_headers(e.headers),
+                )
+            if e.code >= 500:
+                raise SendOutcomeUnknownError(f"Dialpad API error (HTTP {e.code}): {error_msg}") from e
+            raise RuntimeError(f"Dialpad API error (HTTP {e.code}): {error_msg}") from e
+        except urllib.error.URLError as e:
+            if http_retry.send_url_error_safe(e):
+                raise _SafeRetrySendError(f"Network error: {e.reason}") from e
+            raise SendOutcomeUnknownError(f"Network error: {e.reason}") from e
+        except OSError as e:
+            # Socket failures during read/response are past the point where a
+            # duplicate is provably impossible.
+            raise SendOutcomeUnknownError(f"Network error: {e}") from e
+
+    try:
+        return http_retry.run(
+            _attempt,
+            retry_decision=lambda exc: (
+                http_retry.RetryDecision(retry_after=exc.retry_after)
+                if isinstance(exc, _SafeRetrySendError)
+                else None
+            ),
+            budget_seconds=None,
+            sleep=_sleep,
+            random_fn=_random_fn,
+        )
+    except _SafeRetrySendError as e:
+        raise RuntimeError(str(e)) from e
 
 
 def main():

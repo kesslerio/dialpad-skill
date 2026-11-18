@@ -13,6 +13,7 @@ from pathlib import Path
 
 from _dialpad_compat import (
     COMMAND_IDS,
+    SEND_OUTCOME_UNKNOWN_MESSAGE,
     WrapperArgumentParser,
     append_sms_send_receipt,
     emit_success,
@@ -391,9 +392,11 @@ def recover_claimed_approval_audit(args: argparse.Namespace, error: Exception) -
 
     A local failure (missing managed dependencies, direct-send fallback failure)
     means no send completed: the draft must not become terminally `failed` or
-    be lost, and no delivery record may be written for it. Returns sanitized
-    audit context for the error envelope, or None when nothing was claimed or
-    the release itself failed.
+    be lost, and no delivery record may be written for it. Never call this for
+    `SendOutcomeUnknownError` — a possibly-accepted send is a terminal
+    `fail_claimed_approval_audit` case. Returns sanitized audit context for the
+    error envelope, or None when nothing was claimed or the release itself
+    failed.
     """
     if not args.resolve_draft_id:
         return None
@@ -530,6 +533,17 @@ def main() -> int:
                     )
                     append_sms_send_receipt(payload, result, source="direct_sms_fallback")
                 except Exception as direct_err:
+                    if isinstance(direct_err, getattr(_direct_send_sms_module, "SendOutcomeUnknownError", ())):
+                        # The provider may have accepted the send: the claim must
+                        # end terminally `failed` like the generated-CLI and
+                        # approve lanes, never released back to a re-sendable
+                        # status (#170).
+                        fail_claimed_approval_audit(args, direct_err)
+                        raise WrapperError(
+                            f"{SEND_OUTCOME_UNKNOWN_MESSAGE}: {direct_err}",
+                            code="send_outcome_unknown",
+                            retryable=False,
+                        ) from direct_err
                     # A local failure is not a delivery outcome: release the claimed
                     # draft back to a retryable status instead of recording a
                     # terminal `failed` send (#155).
@@ -606,6 +620,11 @@ def main() -> int:
             pass
         return 0
     except WrapperError as err:
+        if json_mode:
+            return handle_wrapper_exception(command, wrapper, err, True)
+        print_wrapper_error(err)
+        return 2
+    except Exception as err:  # noqa: BLE001 - wrappers must return structured JSON in --json mode.
         if json_mode:
             return handle_wrapper_exception(command, wrapper, err, True)
         print_wrapper_error(err)

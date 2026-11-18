@@ -503,6 +503,83 @@ def test_send_sms_unknown_arg_is_refused(server) -> None:
     assert server.send_runner.calls == []
 
 
+def test_send_sms_allow_outside_window_appends_child_flag(server) -> None:
+    result = _tool_call(
+        server,
+        "send_sms",
+        {"to": "+13105550100", "message": "hi", "allow_outside_window": True},
+    )
+    assert result["isError"] is False
+    argv = server.send_runner.calls[0]["argv"]
+    assert "--allow-outside-window" in argv
+
+
+def test_send_sms_allow_outside_window_absent_means_no_flag(server) -> None:
+    _tool_call(server, "send_sms", {"to": "+13105550100", "message": "hi"})
+    assert "--allow-outside-window" not in server.send_runner.calls[0]["argv"]
+
+
+def test_send_sms_dry_run_with_allow_outside_window(server) -> None:
+    result = _tool_call(
+        server,
+        "send_sms",
+        {"to": "+13105550100", "message": "hi", "dry_run": True, "allow_outside_window": True},
+    )
+    assert result["isError"] is False
+    argv = server.send_runner.calls[0]["argv"]
+    assert "--dry-run" in argv
+    assert "--allow-outside-window" in argv
+
+
+@pytest.mark.parametrize("bad", ["true", 1, "yes", 0])
+def test_send_sms_allow_outside_window_must_be_boolean(server, bad) -> None:
+    result = _tool_call(
+        server,
+        "send_sms",
+        {"to": "+13105550100", "message": "hi", "allow_outside_window": bad},
+    )
+    assert result["isError"] is True
+    assert _tool_payload(result)["error"]["code"] == "invalid_argument"
+    assert server.send_runner.calls == []
+
+
+def test_send_sms_gate_refusal_forwards_reason_codes(make_server) -> None:
+    envelope = {
+        "ok": False,
+        "command": "send_sms.send",
+        "error": {"code": "send_gate_refused", "message": "Send gate refused", "retryable": True},
+        "meta": {
+            "send_gate": {
+                "allowed": False,
+                "reasons": [
+                    "outside_recommended_window: recipient +13105550100 is at 22:40 local "
+                    "(America/Los_Angeles); the recommended send window is 08:00-21:00 "
+                    "recipient-local; pass allow_outside_window=true to send anyway"
+                ],
+                "reason_codes": ["outside_recommended_window"],
+                "retryable": True,
+                "retry_after_seconds": 300,
+                "caller": "team-scott",
+            }
+        },
+    }
+    server = make_server(runner=RecordingRunner(envelope=envelope))
+    result = _tool_call(server, "send_sms", {"to": "+13105550100", "message": "hi", "dry_run": True})
+    payload = _tool_payload(result)
+    assert payload["error"]["code"] == "send_gate_refused"
+    assert payload["error"]["reason_codes"] == ["outside_recommended_window"]
+    assert payload["error"]["send_gate"]["reason_codes"] == ["outside_recommended_window"]
+
+
+def test_send_sms_tool_schema_documents_allow_outside_window(server) -> None:
+    response = json.load(_rpc(server, "tools/list"))
+    send_sms_tool = next(tool for tool in response["result"]["tools"] if tool["name"] == "send_sms")
+    prop = send_sms_tool["inputSchema"]["properties"]["allow_outside_window"]
+    assert prop["type"] == "boolean"
+    assert "allow_outside_window" not in send_sms_tool["inputSchema"]["required"]
+    assert "outside_recommended_window" in send_sms_tool["description"]
+
+
 # ---------------------------------------------------------------------------
 # Read tools
 # ---------------------------------------------------------------------------

@@ -127,6 +127,11 @@ def main():
         help="Evaluate the send gate and print the request without sending"
     )
     parser.add_argument(
+        "--allow-outside-window",
+        action="store_true",
+        help="Send anyway when the recipient is outside the recommended 08:00-21:00 local send window"
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="Output result as JSON"
@@ -148,7 +153,15 @@ def main():
         caller=caller,
         from_number=args.from_number,
         to_numbers=normalized_to,
+        allow_outside_window=args.allow_outside_window,
     )
+    if gate.overrides:
+        print(
+            f"send gate override used: {','.join(gate.overrides)} "
+            f"caller={gate.caller or caller or '-'} "
+            f"to_tail={','.join(number[-4:] for number in normalized_to)}",
+            file=sys.stderr,
+        )
 
     if args.dry_run:
         report = {
@@ -212,7 +225,7 @@ def main():
                 from_number=args.from_number or str(result.get("from_number") or ""),
                 body=args.message,
             )
-            result = {**result, **{key: value for key, value in memory_sync.items() if key.startswith("memory_")}}
+            result = {**result, **{key: value for key, value in memory_sync.items() if key.startswith("memory_")}, "send_gate": gate.public()}
             sms_receipts.append_receipt(
                 request_payload={
                     "to_numbers": normalized_to,

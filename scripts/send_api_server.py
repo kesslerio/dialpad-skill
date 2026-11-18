@@ -372,12 +372,16 @@ def execute_gated_send(
     send_runner: Any,
     timeout: float = SEND_TIMEOUT_SECONDS,
     command: str = "send_api.send",
+    allow_outside_window: bool = False,
 ) -> tuple[int, dict[str, Any]]:
     """Run the gated ``bin/send_sms.py`` subprocess for one mapped caller.
 
     The message rides on stdin and ``DIALPAD_SEND_CALLER`` is scrubbed from
     the child environment. Returns (status, service envelope); shared by the
     send API and the team MCP server so both relay the same child codes.
+    ``allow_outside_window`` forwards the caller's explicit waiver of the
+    advisory send window; the HTTP send API never sets it (only the team
+    MCP ``send_sms`` tool can opt in).
     """
     argv = [
         sys.executable,
@@ -393,6 +397,8 @@ def execute_gated_send(
     ]
     if dry_run:
         argv.append("--dry-run")
+    if allow_outside_window:
+        argv.append("--allow-outside-window")
     env = {key: value for key, value in environ.items() if key != send_gate.CALLER_ENV}
     try:
         proc = send_runner(argv, message=message, env=env, timeout=timeout)
@@ -436,6 +442,8 @@ def _map_child_result(proc: subprocess.CompletedProcess, command: str, *, dry_ru
             "reasons": [str(reason) for reason in gate.get("reasons") or []],
             "send_gate": gate,
         }
+        if gate.get("reason_codes") is not None:
+            error["reason_codes"] = [str(reason_code) for reason_code in gate.get("reason_codes") or []]
         if gate.get("retry_after_seconds") is not None:
             error["retry_after_seconds"] = gate["retry_after_seconds"]
         return 422, {"ok": False, "command": command, "error": error, "meta": dict(SERVICE_META)}

@@ -496,6 +496,194 @@ class MinuteRuleTests(unittest.TestCase):
         self.assertIn("minute", decision.reasons[0])
 
 
+class AdvisoryWindowTests(unittest.TestCase):
+    """The 08:00-21:00 window is advisory: a refusal carries
+    ``outside_recommended_window`` and ``allow_outside_window=True`` waives
+    just the window check while every hard rule still applies."""
+
+    # 15:59 UTC = 07:59 Pacific: outside the window, minute :59 allowed.
+    OUTSIDE_UTC = datetime(2026, 1, 15, 15, 59, 0, tzinfo=timezone.utc)
+    # 15:00 UTC = 07:00 Pacific: outside the window AND a blocked minute.
+    OUTSIDE_BLOCKED_MINUTE_UTC = datetime(2026, 1, 15, 15, 0, 0, tzinfo=timezone.utc)
+
+    def _config_file(self, config):
+        tmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+        try:
+            json.dump(config, tmp)
+        finally:
+            tmp.close()
+        self.addCleanup(lambda: Path(tmp.name).unlink(missing_ok=True))
+        return tmp.name
+
+    def test_outside_window_refusal_carries_code_and_override_hint(self):
+        decision = _evaluate(now_utc=self.OUTSIDE_UTC)
+        self.assertFalse(decision.allowed)
+        self.assertTrue(decision.retryable)
+        self.assertIsNotNone(decision.retry_after_seconds)
+        self.assertEqual(decision.reason_codes, [send_gate.CODE_OUTSIDE_RECOMMENDED_WINDOW])
+        self.assertEqual(
+            decision.public()["reason_codes"],
+            [send_gate.CODE_OUTSIDE_RECOMMENDED_WINDOW],
+        )
+        reason = decision.reasons[0]
+        self.assertIn(send_gate.CODE_OUTSIDE_RECOMMENDED_WINDOW, reason)
+        self.assertIn("recommended send window is 08:00-21:00", reason)
+        self.assertIn("allow_outside_window=true", reason)
+        self.assertNotIn("overrides", decision.public())
+
+    def test_override_allows_outside_window_send(self):
+        decision = _evaluate(now_utc=self.OUTSIDE_UTC, allow_outside_window=True)
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.overrides, [send_gate.CODE_OUTSIDE_RECOMMENDED_WINDOW])
+        self.assertEqual(
+            decision.public()["overrides"], [send_gate.CODE_OUTSIDE_RECOMMENDED_WINDOW]
+        )
+        self.assertEqual(
+            decision.receipt_context()["overrides"],
+            [send_gate.CODE_OUTSIDE_RECOMMENDED_WINDOW],
+        )
+        self.assertEqual(
+            decision.details["overrides"], [send_gate.CODE_OUTSIDE_RECOMMENDED_WINDOW]
+        )
+        self.assertEqual(
+            decision.details["recipients"][PACIFIC_TO]["overrides"],
+            [send_gate.CODE_OUTSIDE_RECOMMENDED_WINDOW],
+        )
+
+    def test_override_records_when_only_some_zones_are_outside(self):
+        # 13:01 UTC = 07:01 Central / 08:01 Eastern: one zone overridden.
+        decision = _evaluate(
+            to_numbers=[MULTIZONE_TO],
+            now_utc=datetime(2026, 1, 15, 13, 1, 0, tzinfo=timezone.utc),
+            allow_outside_window=True,
+        )
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.overrides, [send_gate.CODE_OUTSIDE_RECOMMENDED_WINDOW])
+
+    def test_override_inside_window_records_no_override(self):
+        decision = _evaluate(now_utc=GOOD_UTC, allow_outside_window=True)
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.overrides, [])
+        self.assertNotIn("overrides", decision.public())
+        self.assertNotIn("overrides", decision.receipt_context())
+        self.assertNotIn("overrides", decision.details)
+
+    def test_override_does_not_bypass_unapproved_from_line(self):
+        decision = _evaluate(from_number="+14158701945", allow_outside_window=True)
+        self.assertFalse(decision.allowed)
+        self.assertIn("not an approved line", decision.reasons[0])
+
+    def test_override_does_not_bypass_unknown_caller(self):
+        decision = _evaluate(caller="nobody", allow_outside_window=True)
+        self.assertFalse(decision.allowed)
+        self.assertIn("unknown caller", decision.reasons[0])
+
+    def test_override_does_not_bypass_company_opt_out(self):
+        decision = _evaluate(
+            allow_outside_window=True,
+            opt_out_sources=_sources(company=lambda: {"3105550100"}),
+        )
+        self.assertFalse(decision.allowed)
+        self.assertIn("dialpad company list", decision.reasons[0])
+
+    def test_override_does_not_bypass_local_opt_out(self):
+        decision = _evaluate(
+            allow_outside_window=True,
+            opt_out_sources=_sources(local=lambda number: True),
+        )
+        self.assertFalse(decision.allowed)
+        self.assertIn("local opt-out", decision.reasons[0])
+
+    def test_override_does_not_bypass_unknown_area_code(self):
+        decision = _evaluate(to_numbers=[UNKNOWN_AC_TO], allow_outside_window=True)
+        self.assertFalse(decision.allowed)
+        self.assertIn("unknown", decision.reasons[0].lower())
+
+    def test_override_still_applies_minute_rule_to_waived_zones(self):
+        decision = _evaluate(
+            now_utc=self.OUTSIDE_BLOCKED_MINUTE_UTC,
+            allow_outside_window=True,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertTrue(decision.retryable)
+        self.assertIsNotNone(decision.retry_after_seconds)
+        self.assertIn("minute", decision.reasons[0])
+        self.assertEqual(decision.reason_codes, [send_gate.CODE_BLOCKED_MINUTE])
+        # The window waiver was exercised and stays recorded on the refusal.
+        self.assertEqual(decision.overrides, [send_gate.CODE_OUTSIDE_RECOMMENDED_WINDOW])
+
+    def test_without_override_blocked_minute_still_reports_window_only(self):
+        # Outside the window at a blocked minute without the flag reports the
+        # window refusal alone — the same reason text/code set as before.
+        decision = _evaluate(now_utc=self.OUTSIDE_BLOCKED_MINUTE_UTC)
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reason_codes, [send_gate.CODE_OUTSIDE_RECOMMENDED_WINDOW])
+        self.assertNotIn("minute", decision.reasons[0])
+        self.assertEqual(decision.overrides, [])
+
+    def test_time_restricted_false_caller_stays_unrestricted_with_flag(self):
+        # operator carries time_restricted: false — the flag changes nothing
+        # and no override is recorded because the window check never ran.
+        decision = _evaluate(
+            caller="operator",
+            from_number="+14155550140",
+            now_utc=self.OUTSIDE_UTC,
+            allow_outside_window=True,
+        )
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.overrides, [])
+
+    def test_evaluate_from_environment_forwards_allow_outside_window(self):
+        path = self._config_file(CONFIG)
+        env = {"DIALPAD_SEND_GATE_CONFIG": path}
+        decision = send_gate.evaluate_from_environment(
+            caller="team-scott",
+            from_number="+14159065785",
+            to_numbers=[PACIFIC_TO],
+            now_utc=self.OUTSIDE_UTC,
+            opt_out_sources=_sources(),
+            env=env,
+            allow_outside_window=True,
+        )
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.overrides, [send_gate.CODE_OUTSIDE_RECOMMENDED_WINDOW])
+
+        refused = send_gate.evaluate_from_environment(
+            caller="team-scott",
+            from_number="+14159065785",
+            to_numbers=[PACIFIC_TO],
+            now_utc=self.OUTSIDE_UTC,
+            opt_out_sources=_sources(),
+            env=env,
+        )
+        self.assertFalse(refused.allowed)
+        self.assertEqual(refused.reason_codes, [send_gate.CODE_OUTSIDE_RECOMMENDED_WINDOW])
+
+    def test_evaluate_approved_send_forwards_allow_outside_window(self):
+        path = self._config_file(CONFIG)
+        env = {"DIALPAD_SEND_GATE_CONFIG": path, "DIALPAD_SEND_CALLER": "team-scott"}
+        decision = send_gate.evaluate_approved_send(
+            from_number="+14159065785",
+            to_numbers=[PACIFIC_TO],
+            now_utc=self.OUTSIDE_UTC,
+            opt_out_sources=_sources(),
+            env=env,
+            allow_outside_window=True,
+        )
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.caller, "team-scott")
+        self.assertEqual(decision.overrides, [send_gate.CODE_OUTSIDE_RECOMMENDED_WINDOW])
+
+        refused = send_gate.evaluate_approved_send(
+            from_number="+14159065785",
+            to_numbers=[PACIFIC_TO],
+            now_utc=self.OUTSIDE_UTC,
+            opt_out_sources=_sources(),
+            env=env,
+        )
+        self.assertFalse(refused.allowed)
+
+
 class GroupSendTests(unittest.TestCase):
     def test_one_bad_recipient_refuses_whole_send(self):
         decision = _evaluate(to_numbers=[PACIFIC_TO, EASTERN_TO], opt_out_sources=_sources(
@@ -879,12 +1067,12 @@ class WrapperIntegrationTests(unittest.TestCase):
                 sys.modules["send_sms"] = previous
         return wrapper
 
-    def _run_wrapper(self, wrapper, argv, env_extra=None, sources=None):
+    def _run_wrapper(self, wrapper, argv, env_extra=None, sources=None, now=None):
         env = {"DIALPAD_SEND_GATE_CONFIG": self.config_path}
         env.update(env_extra or {})
         with patch.dict("os.environ", env, clear=False), \
                 patch.object(send_gate, "env_opt_out_sources", return_value=sources or _sources()), \
-                patch.object(send_gate, "_utc_now", return_value=GOOD_UTC), \
+                patch.object(send_gate, "_utc_now", return_value=now or GOOD_UTC), \
                 patch.object(sys, "argv", argv):
             stdout = io.StringIO()
             stderr = io.StringIO()
@@ -995,6 +1183,103 @@ class WrapperIntegrationTests(unittest.TestCase):
         parsed = json.loads(out)
         self.assertEqual(parsed["error"]["code"], "send_gate_refused")
 
+    # 15:59 UTC = 07:59 Pacific: outside the recommended window, minute :59 ok.
+    OUTSIDE_UTC = datetime(2026, 1, 15, 15, 59, 0, tzinfo=timezone.utc)
+
+    def test_outside_window_refusal_carries_reason_code(self):
+        wrapper = self._load_wrapper()
+        with patch.object(wrapper, "require_generated_cli"), \
+                patch.object(wrapper, "run_generated_json") as run_json:
+            code, out, err = self._run_wrapper(
+                wrapper,
+                [
+                    "bin/send_sms.py",
+                    "--to", PACIFIC_TO,
+                    "--from", "+14159065785",
+                    "--caller", "team-scott",
+                    "--message", "hi",
+                    "--dry-run",
+                    "--json",
+                ],
+                now=self.OUTSIDE_UTC,
+            )
+
+        self.assertEqual(code, 2)
+        run_json.assert_not_called()
+        parsed = json.loads(out)
+        self.assertEqual(parsed["error"]["code"], "send_gate_refused")
+        gate = parsed["meta"]["send_gate"]
+        self.assertEqual(gate["reason_codes"], ["outside_recommended_window"])
+        self.assertTrue(gate["retryable"])
+
+    def test_dry_run_allow_outside_window_records_override(self):
+        wrapper = self._load_wrapper()
+        with patch.object(wrapper, "require_generated_cli"), \
+                patch.object(wrapper, "require_api_key") as require_key, \
+                patch.object(wrapper, "run_generated_json") as run_json:
+            code, out, err = self._run_wrapper(
+                wrapper,
+                [
+                    "bin/send_sms.py",
+                    "--to", PACIFIC_TO,
+                    "--from", "+14159065785",
+                    "--caller", "team-scott",
+                    "--message", "hi",
+                    "--allow-outside-window",
+                    "--dry-run",
+                    "--json",
+                ],
+                now=self.OUTSIDE_UTC,
+            )
+
+        self.assertEqual(code, 0)
+        require_key.assert_not_called()
+        run_json.assert_not_called()
+        parsed = json.loads(out)
+        self.assertTrue(parsed["ok"])
+        self.assertEqual(
+            parsed["data"]["send_gate"]["overrides"], ["outside_recommended_window"]
+        )
+        self.assertIn(
+            "send gate override used: outside_recommended_window caller=team-scott", err
+        )
+        self.assertIn("0100", err)
+        self.assertNotIn(PACIFIC_TO, err)
+
+    def test_allow_outside_window_real_send_json_includes_gate_overrides(self):
+        wrapper = self._load_wrapper()
+        with patch.object(wrapper, "require_generated_cli"), \
+                patch.object(wrapper, "require_api_key"), \
+                patch.object(
+                    wrapper,
+                    "run_generated_json",
+                    return_value={"id": "msg-w1", "message_status": "pending"},
+                ) as run_json, \
+                patch.object(wrapper, "record_outbound_observation", return_value={"memory_sync": "disabled"}), \
+                patch.object(wrapper, "drain_on_use"):
+            code, out, err = self._run_wrapper(
+                wrapper,
+                [
+                    "bin/send_sms.py",
+                    "--to", PACIFIC_TO,
+                    "--from", "+14159065785",
+                    "--caller", "team-scott",
+                    "--message", "hi",
+                    "--allow-outside-window",
+                    "--json",
+                ],
+                now=self.OUTSIDE_UTC,
+            )
+
+        self.assertEqual(code, 0)
+        run_json.assert_called_once()
+        parsed = json.loads(out)
+        self.assertTrue(parsed["ok"])
+        self.assertEqual(
+            parsed["data"]["send_gate"]["overrides"], ["outside_recommended_window"]
+        )
+        self.assertIn("send gate override used: outside_recommended_window", err)
+
 
 class ScriptsSendSmsGateTests(unittest.TestCase):
     """scripts/send_sms.py gates main() before POST /sms."""
@@ -1065,6 +1350,89 @@ class ScriptsSendSmsGateTests(unittest.TestCase):
         self.assertEqual(parsed["error"]["code"], "send_gate_refused")
         self.assertEqual(parsed["mode"], "dry_run")
         self.assertIn("send_gate", parsed)
+
+    # 15:59 UTC = 07:59 Pacific: outside the recommended window, minute :59 ok.
+    OUTSIDE_UTC = datetime(2026, 1, 15, 15, 59, 0, tzinfo=timezone.utc)
+
+    def _gate_env(self):
+        return {
+            "DIALPAD_SEND_GATE_CONFIG": self.config_path,
+            "DIALPAD_API_KEY": "k",
+        }
+
+    def _argv(self, *extra):
+        return [
+            "scripts/send_sms.py",
+            "--to", PACIFIC_TO,
+            "--from", "+14159065785",
+            "--caller", "team-scott",
+            "--message", "hi",
+            *extra,
+        ]
+
+    def test_direct_script_outside_window_refusal_carries_reason_code(self):
+        module = self._load_script_module()
+        with patch.dict("os.environ", self._gate_env(), clear=False), \
+                patch.object(send_gate, "env_opt_out_sources", return_value=_sources()), \
+                patch.object(send_gate, "_utc_now", return_value=self.OUTSIDE_UTC), \
+                patch.object(module, "send_sms") as provider_send, \
+                patch.object(sys, "argv", self._argv("--json")), \
+                self.assertRaises(SystemExit) as ctx, \
+                redirect_stdout(io.StringIO()) as stdout, \
+                redirect_stderr(io.StringIO()):
+            module.main()
+        self.assertEqual(ctx.exception.code, 2)
+        provider_send.assert_not_called()
+        parsed = json.loads(stdout.getvalue())
+        self.assertEqual(parsed["error"]["code"], "send_gate_refused")
+        self.assertEqual(
+            parsed["error"]["send_gate"]["reason_codes"], ["outside_recommended_window"]
+        )
+
+    def test_direct_script_allow_outside_window_dry_run(self):
+        module = self._load_script_module()
+        with patch.dict("os.environ", self._gate_env(), clear=False), \
+                patch.object(send_gate, "env_opt_out_sources", return_value=_sources()), \
+                patch.object(send_gate, "_utc_now", return_value=self.OUTSIDE_UTC), \
+                patch.object(module, "send_sms") as provider_send, \
+                patch.object(sys, "argv", self._argv("--allow-outside-window", "--dry-run", "--json")), \
+                self.assertRaises(SystemExit) as ctx, \
+                redirect_stdout(io.StringIO()) as stdout, \
+                redirect_stderr(io.StringIO()) as stderr:
+            module.main()
+        self.assertEqual(ctx.exception.code, 0)
+        provider_send.assert_not_called()
+        parsed = json.loads(stdout.getvalue())
+        self.assertEqual(
+            parsed["send_gate"]["overrides"], ["outside_recommended_window"]
+        )
+        self.assertIn(
+            "send gate override used: outside_recommended_window caller=team-scott",
+            stderr.getvalue(),
+        )
+        self.assertNotIn(PACIFIC_TO, stderr.getvalue())
+
+    def test_direct_script_real_send_json_includes_gate_overrides(self):
+        module = self._load_script_module()
+        with patch.dict("os.environ", self._gate_env(), clear=False), \
+                patch.object(send_gate, "env_opt_out_sources", return_value=_sources()), \
+                patch.object(send_gate, "_utc_now", return_value=self.OUTSIDE_UTC), \
+                patch.object(
+                    module, "send_sms",
+                    return_value={"id": "m-override", "message_status": "pending"},
+                ), \
+                patch.object(module, "record_outbound_observation", return_value={"memory_sync": "disabled"}), \
+                patch.object(module.sms_receipts, "append_receipt"), \
+                patch.object(sys, "argv", self._argv("--allow-outside-window", "--json")), \
+                self.assertRaises(SystemExit) as ctx, \
+                redirect_stdout(io.StringIO()) as stdout, \
+                redirect_stderr(io.StringIO()) as stderr:
+            module.main()
+        self.assertEqual(ctx.exception.code, 0)
+        parsed = json.loads(stdout.getvalue())
+        self.assertEqual(parsed["id"], "m-override")
+        self.assertEqual(parsed["send_gate"]["overrides"], ["outside_recommended_window"])
+        self.assertIn("send gate override used: outside_recommended_window", stderr.getvalue())
 
     def test_direct_script_from_is_required(self):
         module = self._load_script_module()

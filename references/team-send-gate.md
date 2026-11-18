@@ -21,11 +21,22 @@ generated-CLI path.
   full cursor pagination, company from `DIALPAD_COMPANY_ID`, key from
   `DIALPAD_API_KEY`) UNION `sms_approval_opt_outs` + emergency opt-out markers.
   Either source unreadable refuses the send.
-- **Recipient-local window:** 08:00 <= local < 21:00 in every zone the area
-  code can cover (`scripts/nanp_area_code_timezones.py`). Unknown or
-  non-US/Canada area codes refuse.
-- **Minute rule:** recipient-local minute must not be :00/:15/:30/:45.
-  Retryable refusals carry `retry_after_seconds`.
+- **Recipient-local window (recommended, advisory):** 08:00 <= local < 21:00
+  in every zone the area code can cover
+  (`scripts/nanp_area_code_timezones.py`). Unknown or non-US/Canada area
+  codes refuse outright (hard). The window is the recommended default, not
+  a hard block: an outside-window refusal is retryable, carries the
+  `outside_recommended_window` reason code, and says to pass
+  `allow_outside_window=true` to send anyway — `--allow-outside-window` on
+  the CLIs, `allow_outside_window` on the gate functions and the MCP
+  `send_sms` tool. A used override is recorded on the decision
+  (`overrides`, plus the receipt ledger line). It never bypasses any other
+  check.
+- **Minute rule:** recipient-local minute must not be :00/:15/:30/:45 —
+  never overridable. Without the window override it is evaluated only for
+  zones inside the window; with `allow_outside_window` it also applies to
+  the waived zones, so an overridden send at a blocked minute is still
+  refused. Retryable refusals carry `retry_after_seconds`.
 - Group sends refuse if any recipient fails.
 
 Refusals exit non-zero with `send_gate_refused` in the wrapper JSON envelope;
@@ -208,15 +219,21 @@ every set everywhere.
 
 Tools (each with `additionalProperties: false`; unknown args error):
 
-- `send_sms(to, message, from?, dry_run?)` — `from` defaults to the caller's
-  own `acts_for` line; the support line is refused as `to` or `from` before
-  anything runs. Sends go through the exact gated path the send API uses —
+- `send_sms(to, message, from?, dry_run?, allow_outside_window?)` — `from`
+  defaults to the caller's own `acts_for` line; the support line is refused
+  as `to` or `from` before anything runs. Sends go through the exact gated
+  path the send API uses —
   `send_api_server.execute_gated_send` → `bin/send_sms.py --message-stdin
   --json` with `--caller <mapped>` and `DIALPAD_SEND_CALLER` scrubbed — so
   opt-outs, send window, minute rule, and line allowlists are enforced
-  unchanged. Gate refusals and unknown outcomes surface as tool errors with
-  the same codes (`send_gate_refused`, `send_outcome_unknown`, …). Message
-  text never reaches argv or logs.
+  unchanged. `allow_outside_window` (strict boolean) opts out of the
+  recommended 08:00-21:00 recipient-local window only: it forwards
+  `--allow-outside-window` to the gated CLI, an override use is recorded on
+  the decision and logged in the server audit line, and it never bypasses
+  opt-outs, line allowlists, or the minute rule. Gate refusals and unknown
+  outcomes surface as tool errors with the same codes
+  (`send_gate_refused`, `send_outcome_unknown`, …) and `reason_codes` when
+  present. Message text never reaches argv or logs.
 - `list_conversations(limit?, since?)` — read-only SQLite on
   `DIALPAD_SMS_DB`, grouped per (`our_line`, contact) with last activity,
   direction, preview, and unread counts, restricted to the caller's allowed

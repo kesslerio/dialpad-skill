@@ -11,10 +11,16 @@ closed:
    pagination, company id from ``DIALPAD_COMPANY_ID``) UNION the local
    ``sms_approval_opt_outs`` table plus the emergency opt-out markers (read
    strictly). An unreadable or malformed source refuses.
-3. Recipient-local send window 08:00 <= local time < 21:00, in EVERY timezone
-   the recipient's NANP area code can cover (vendored table in
-   ``nanp_area_code_timezones``; unknown area code or non-NANP refuses).
-4. Recipient-local minute must not be 0/15/30/45.
+3. Recipient-local recommended send window 08:00 <= local time < 21:00, in
+   EVERY timezone the recipient's NANP area code can cover (vendored table
+   in ``nanp_area_code_timezones``; unknown area code or non-NANP refuses).
+   The window is advisory, not a hard block: a refusal carries the
+   ``outside_recommended_window`` reason code and can be overridden per call
+   with ``allow_outside_window=True`` when a person explicitly chooses the
+   hour.
+4. Recipient-local minute must not be 0/15/30/45. The minute rule is never
+   overridable, and with the window override on it also applies to zones
+   outside the window.
 
 Refusals for allowlist/opt-out/config are never retryable; window/minute
 refusals are retryable and carry a ``retry_after_seconds`` hint.
@@ -50,6 +56,17 @@ _OPT_OUT_TIMEOUT_SECONDS = 15.0
 _OPT_OUT_MAX_PAGES = 200
 _RETRY_HORIZON_MINUTES = 26 * 60
 
+# Stable machine codes carried in Decision.reason_codes (aligned with
+# Decision.reasons) so clients can key on a refusal without parsing text.
+CODE_CONFIG_ERROR = "config_error"
+CODE_UNKNOWN_CALLER = "unknown_caller"
+CODE_FROM_LINE_NOT_APPROVED = "from_line_not_approved"
+CODE_OPT_OUT_SOURCE_UNAVAILABLE = "opt_out_source_unavailable"
+CODE_RECIPIENT_OPTED_OUT = "recipient_opted_out"
+CODE_UNKNOWN_AREA_CODE = "unknown_area_code"
+CODE_OUTSIDE_RECOMMENDED_WINDOW = "outside_recommended_window"
+CODE_BLOCKED_MINUTE = "blocked_minute"
+
 
 class SendGateError(Exception):
     """Configuration or environment needed by the gate is missing or invalid."""
@@ -65,16 +82,19 @@ class Decision:
 
     allowed: bool = False
     reasons: list[str] = field(default_factory=list)
+    reason_codes: list[str] = field(default_factory=list)
     retryable: bool = False
     retry_after_seconds: int | None = None
     caller: str | None = None
     acting_for: str | None = None
+    overrides: list[str] = field(default_factory=list)
     details: dict[str, Any] = field(default_factory=dict)
 
     def public(self) -> dict[str, Any]:
         data: dict[str, Any] = {
             "allowed": self.allowed,
             "reasons": list(self.reasons),
+            "reason_codes": list(self.reason_codes),
             "retryable": self.retryable,
         }
         if self.retry_after_seconds is not None:
@@ -83,6 +103,8 @@ class Decision:
             data["caller"] = self.caller
         if self.acting_for:
             data["acting_for"] = self.acting_for
+        if self.overrides:
+            data["overrides"] = list(self.overrides)
         if self.details:
             data["checks"] = self.details
         return data
@@ -94,6 +116,8 @@ class Decision:
             context["caller"] = self.caller
         if self.acting_for:
             context["acting_for"] = self.acting_for
+        if self.overrides:
+            context["overrides"] = list(self.overrides)
         return context
 
 
@@ -113,19 +137,23 @@ class OptOutSources:
 def _refuse(
     reasons: list[str],
     *,
+    reason_codes: list[str] | None = None,
     caller: str | None = None,
     acting_for: str | None = None,
     retryable: bool = False,
     retry_after_seconds: int | None = None,
+    overrides: list[str] | None = None,
     details: dict[str, Any] | None = None,
 ) -> Decision:
     return Decision(
         allowed=False,
         reasons=reasons,
+        reason_codes=reason_codes or [],
         retryable=retryable,
         retry_after_seconds=retry_after_seconds,
         caller=caller,
         acting_for=acting_for,
+        overrides=overrides or [],
         details=details or {},
     )
 
@@ -451,8 +479,16 @@ def evaluate_send(
     now_utc: datetime,
     opt_out_sources: OptOutSources,
     config: dict[str, Any],
+    allow_outside_window: bool = False,
 ) -> Decision:
-    """Pure gate evaluation: all checks must pass; the send fails closed."""
+    """Pure gate evaluation: all checks must pass; the send fails closed.
+
+    ``allow_outside_window`` waives only the advisory recipient-local window
+    check, and the decision records the override as ``outside_recommended_window``
+    when it is actually used (a recipient zone was outside the window).
+    Caller/line, opt-out, area-code, and config checks stay hard, and the
+    minute rule still applies to overridden zones.
+    """
     if now_utc.tzinfo is None:
         now_utc = now_utc.replace(tzinfo=timezone.utc)
     else:
@@ -464,6 +500,7 @@ def evaluate_send(
     if not isinstance(entry, dict):
         return _refuse(
             [f"send gate: unknown caller {caller_id or '<unset>'!r}"],
+            reason_codes=[CODE_UNKNOWN_CALLER],
             caller=caller_id,
         )
     acting_for = entry.get("acts_for")
@@ -476,6 +513,7 @@ def evaluate_send(
                 f"send gate: from number {from_number or '<unset>'!r} is not an approved "
                 f"line for caller {caller_id}"
             ],
+            reason_codes=[CODE_FROM_LINE_NOT_APPROVED],
             caller=caller_id,
             acting_for=acting_for,
         )
@@ -485,19 +523,24 @@ def evaluate_send(
     except OptOutSourceError as exc:
         return _refuse(
             [f"send gate: opt-out source unavailable: {exc}"],
+            reason_codes=[CODE_OPT_OUT_SOURCE_UNAVAILABLE],
             caller=caller_id,
             acting_for=acting_for,
         )
     except Exception as exc:  # noqa: BLE001 - an unplumbed opt-out failure fails closed too.
         return _refuse(
             [f"send gate: opt-out source unavailable: {exc}"],
+            reason_codes=[CODE_OPT_OUT_SOURCE_UNAVAILABLE],
             caller=caller_id,
             acting_for=acting_for,
         )
 
     time_restricted = entry.get("time_restricted", True) is not False
     hard_reasons: list[str] = []
+    hard_codes: list[str] = []
     time_reasons: list[str] = []
+    time_codes: list[str] = []
+    used_overrides: list[str] = []
     details: dict[str, Any] = {"caller": caller_id, "acting_for": acting_for, "recipients": {}}
     all_zones: list[ZoneInfo] = []
 
@@ -508,16 +551,19 @@ def evaluate_send(
 
         if normalized_to and normalized_to in company_opted_out:
             hard_reasons.append(f"recipient {number} is opted out (dialpad company list)")
+            hard_codes.append(CODE_RECIPIENT_OPTED_OUT)
             recipient["opted_out"] = "dialpad_company"
             continue
         try:
             if opt_out_sources.local_opt_out(number):
                 hard_reasons.append(f"recipient {number} is opted out (local opt-out list)")
+                hard_codes.append(CODE_RECIPIENT_OPTED_OUT)
                 recipient["opted_out"] = "local"
                 continue
         except OptOutSourceError as exc:
             return _refuse(
                 [f"send gate: opt-out source unavailable: {exc}"],
+                reason_codes=[CODE_OPT_OUT_SOURCE_UNAVAILABLE],
                 caller=caller_id,
                 acting_for=acting_for,
                 details=details,
@@ -525,6 +571,7 @@ def evaluate_send(
         except Exception as exc:  # noqa: BLE001 - fail closed on any opt-out lookup error.
             return _refuse(
                 [f"send gate: opt-out source unavailable: {exc}"],
+                reason_codes=[CODE_OPT_OUT_SOURCE_UNAVAILABLE],
                 caller=caller_id,
                 acting_for=acting_for,
                 details=details,
@@ -534,6 +581,7 @@ def evaluate_send(
         zones = list(timezones_for_e164(number))
         if not zones:
             hard_reasons.append(f"recipient {number} has an unknown or non-US/Canada NANP area code")
+            hard_codes.append(CODE_UNKNOWN_AREA_CODE)
             continue
         recipient["timezones"] = [zone.key for zone in zones]
         all_zones.extend(zones)
@@ -543,23 +591,42 @@ def evaluate_send(
         for zone in zones:
             local_dt = now_utc.astimezone(zone)
             recipient.setdefault("local_time", {})[zone.key] = local_dt.isoformat()
-            if not _window_ok(local_dt):
+            window_ok = _window_ok(local_dt)
+            if not window_ok and not allow_outside_window:
                 time_reasons.append(
-                    f"recipient {number} outside send window: {local_dt.strftime('%H:%M')} local ({zone.key})"
+                    f"{CODE_OUTSIDE_RECOMMENDED_WINDOW}: recipient {number} is at "
+                    f"{local_dt.strftime('%H:%M')} local ({zone.key}); the recommended send "
+                    "window is 08:00-21:00 recipient-local; pass allow_outside_window=true "
+                    "to send anyway"
                 )
-            elif not _minute_ok(local_dt):
+                time_codes.append(CODE_OUTSIDE_RECOMMENDED_WINDOW)
+            elif not window_ok:
+                if CODE_OUTSIDE_RECOMMENDED_WINDOW not in recipient.setdefault("overrides", []):
+                    recipient["overrides"].append(CODE_OUTSIDE_RECOMMENDED_WINDOW)
+                if CODE_OUTSIDE_RECOMMENDED_WINDOW not in used_overrides:
+                    used_overrides.append(CODE_OUTSIDE_RECOMMENDED_WINDOW)
+            # The override waives only the window: an overridden zone still
+            # obeys the minute rule (waived zones are checked; refused zones
+            # keep today's behavior of reporting the window reason only).
+            if not _minute_ok(local_dt) and (window_ok or allow_outside_window):
                 time_reasons.append(
                     f"recipient {number} blocked at minute :{local_dt.minute:02d} local ({zone.key})"
                 )
+                time_codes.append(CODE_BLOCKED_MINUTE)
 
     reasons = hard_reasons + time_reasons
+    reason_codes = hard_codes + time_codes
+    if used_overrides:
+        details["overrides"] = list(used_overrides)
     if not reasons:
         return Decision(
             allowed=True,
             reasons=[],
+            reason_codes=[],
             retryable=False,
             caller=caller_id,
             acting_for=acting_for,
+            overrides=used_overrides,
             details=details,
         )
 
@@ -567,10 +634,12 @@ def evaluate_send(
     retry_after = _next_pass_seconds(now_utc, all_zones) if retryable else None
     return _refuse(
         reasons,
+        reason_codes=reason_codes,
         caller=caller_id,
         acting_for=acting_for,
         retryable=retryable,
         retry_after_seconds=retry_after,
+        overrides=used_overrides,
         details=details,
     )
 
@@ -587,16 +656,22 @@ def evaluate_from_environment(
     now_utc: datetime | None = None,
     opt_out_sources: OptOutSources | None = None,
     env: Mapping[str, str] | None = None,
+    allow_outside_window: bool = False,
 ) -> Decision:
     """Config + opt-out sources from the environment, then the pure evaluation."""
     environ = os.environ if env is None else env
     try:
         config = load_config_from_env(environ)
     except SendGateError as exc:
-        return _refuse([f"send gate: {exc}"], caller=(caller or "").strip() or None)
+        return _refuse(
+            [f"send gate: {exc}"],
+            reason_codes=[CODE_CONFIG_ERROR],
+            caller=(caller or "").strip() or None,
+        )
     except Exception as exc:  # noqa: BLE001 - any config failure fails closed.
         return _refuse(
             [f"send gate: config unavailable: {exc}"],
+            reason_codes=[CODE_CONFIG_ERROR],
             caller=(caller or "").strip() or None,
         )
     sources = opt_out_sources or env_opt_out_sources(environ)
@@ -607,6 +682,7 @@ def evaluate_from_environment(
         now_utc=now_utc or _utc_now(),
         opt_out_sources=sources,
         config=config,
+        allow_outside_window=allow_outside_window,
     )
 
 
@@ -640,6 +716,7 @@ def evaluate_approved_send(
     now_utc: datetime | None = None,
     opt_out_sources: OptOutSources | None = None,
     env: Mapping[str, str] | None = None,
+    allow_outside_window: bool = False,
 ) -> Decision:
     """Gate evaluation for a send a person approved (SMS approval drafts).
 
@@ -655,4 +732,5 @@ def evaluate_approved_send(
         now_utc=now_utc,
         opt_out_sources=opt_out_sources,
         env=environ,
+        allow_outside_window=allow_outside_window,
     )

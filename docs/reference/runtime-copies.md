@@ -21,6 +21,15 @@ The probe compares content hashes and is restricted to the reviewed manifest; it
 has no mode that walks a tree. A clean report means the manifest is clean, not
 that the copy is identical to the repo.
 
+The transient-retry/envelope change widened the reviewed set
+(`references/outbox-runtime-files.txt`): when delivering it, copy
+`bin/_dialpad_compat.py`, `bin/list_sms_thread.py`, `bin/list_sms_inbox.py`,
+`bin/list_calls.py`, `bin/send_sms.py`, `bin/send_sms_at.py`,
+`scripts/http_retry.py`, `scripts/log_api_client.py`,
+`scripts/sms_receipts.py`, and `scripts/send_sms.py` together — the wrappers
+import the retry helper at module load, so a partial copy breaks the send
+path.
+
 ## Delivery steps: build the managed dependency tree
 
 `vendor/` is not tracked in git (see `vendor-build.md`); every copy needs it

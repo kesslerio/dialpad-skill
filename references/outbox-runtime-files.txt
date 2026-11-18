@@ -8,7 +8,13 @@
 # Compare a runtime copy with:
 #   python3 scripts/outbox_drift_probe.py --manifest references/outbox-runtime-files.txt --target <copy-root>
 scripts/log_outbox.py
+scripts/log_api_client.py
+scripts/http_retry.py
+scripts/sms_receipts.py
+scripts/send_sms.py
+bin/_dialpad_compat.py
 bin/send_sms.py
+bin/send_sms_at.py
 bin/list_sms_inbox.py
 bin/list_sms_thread.py
 bin/list_calls.py

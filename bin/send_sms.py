@@ -13,6 +13,7 @@ from pathlib import Path
 
 from _dialpad_compat import (
     COMMAND_IDS,
+    SEND_OUTCOME_UNKNOWN_MESSAGE,
     WrapperArgumentParser,
     append_sms_send_receipt,
     emit_success,
@@ -538,11 +539,18 @@ def main() -> int:
                         if recovery:
                             direct_err.meta.setdefault("approval_audit", recovery)
                         raise
-                    wrapped = WrapperError(
-                        f"Direct SMS send failed: {direct_err}",
-                        code="upstream_error",
-                        retryable=True,
-                    )
+                    if isinstance(direct_err, getattr(_direct_send_sms_module, "SendOutcomeUnknownError", ())):
+                        wrapped = WrapperError(
+                            f"{SEND_OUTCOME_UNKNOWN_MESSAGE}: {direct_err}",
+                            code="send_outcome_unknown",
+                            retryable=False,
+                        )
+                    else:
+                        wrapped = WrapperError(
+                            f"Direct SMS send failed: {direct_err}",
+                            code="upstream_error",
+                            retryable=True,
+                        )
                     if recovery:
                         wrapped.meta.setdefault("approval_audit", recovery)
                     raise wrapped from direct_err
@@ -606,6 +614,11 @@ def main() -> int:
             pass
         return 0
     except WrapperError as err:
+        if json_mode:
+            return handle_wrapper_exception(command, wrapper, err, True)
+        print_wrapper_error(err)
+        return 2
+    except Exception as err:  # noqa: BLE001 - wrappers must return structured JSON in --json mode.
         if json_mode:
             return handle_wrapper_exception(command, wrapper, err, True)
         print_wrapper_error(err)

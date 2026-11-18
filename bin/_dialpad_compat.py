@@ -29,6 +29,7 @@ if str(BIN_DIR) not in sys.path:
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.append(str(SCRIPTS_DIR))
 
+import http_retry  # noqa: E402 - needs SCRIPTS_DIR on sys.path
 import sms_receipts  # noqa: E402 - needs SCRIPTS_DIR on sys.path; module-top import so a broken deploy fails before any send, never after one
 
 
@@ -116,8 +117,10 @@ ERROR_CODES = {
     "timeout",
     "partial_success",
     "send_gate_refused",
+    "send_outcome_unknown",
     "internal_error",
 }
+SEND_OUTCOME_UNKNOWN_MESSAGE = "send outcome unknown; check the thread before resending"
 E164_RE = re.compile(r"^\+\d{7,15}$")
 _RECEIPT_SOURCE: str | None = None
 _RECEIPT_STATUS: str | None = None
@@ -134,11 +137,13 @@ class WrapperError(Exception):
         code: str | None = None,
         retryable: bool | None = None,
         meta: dict[str, object] | None = None,
+        retry_after_seconds: float | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.retryable = retryable
         self.meta = meta or {}
+        self.retry_after_seconds = retry_after_seconds
 
 
 class WrapperArgumentParser(argparse.ArgumentParser):
@@ -377,10 +382,41 @@ def is_missing_dependency_error(text: str) -> bool:
     )
 
 
-def run_generated_json(args: list[str]) -> Any:
+class _RetryableGeneratedError(Exception):
+    """One transient generated-CLI failure inside the run_generated_json loop."""
+
+    def __init__(self, message: str, *, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.message = message
+        self.retry_after = retry_after
+
+
+def _generated_retry_decision(exc: BaseException) -> http_retry.RetryDecision | None:
+    if isinstance(exc, _RetryableGeneratedError):
+        return http_retry.RetryDecision(retry_after=exc.retry_after)
+    return None
+
+
+def run_generated_json(
+    args: list[str],
+    *,
+    sleep: Any = None,
+    random_fn: Any = None,
+) -> Any:
+    """Run the generated CLI and return its parsed JSON stdout.
+
+    Retry rule: ``sms send`` is not idempotent, so a send retries only when
+    the failure provably left no accepted request (see http_retry's
+    SAFE-RETRY comment); any other generated command may retry on any
+    transient failure. Attempts are bounded by http_retry's shared policy.
+    """
     cmd = ["--output", "json", *args]
-    proc = run_generated(cmd, capture_output=True)
-    if proc.returncode != 0:
+    is_send = _is_sms_send_command(args)
+
+    def _attempt() -> subprocess.CompletedProcess[str]:
+        proc = run_generated(cmd, capture_output=True)
+        if proc.returncode == 0:
+            return proc
         message = proc.stderr.strip() or proc.stdout.strip() or "generated command failed"
         if is_missing_dependency_error(message):
             raise WrapperError(
@@ -388,7 +424,37 @@ def run_generated_json(args: list[str]) -> Any:
                 code="missing_generated_cli",
                 retryable=False,
             )
+        retry_after = http_retry.retry_after_in_text(message)
+        if is_send:
+            classification = http_retry.classify_send_stderr(message)
+            if classification == http_retry.SEND_SAFE_RETRY:
+                raise _RetryableGeneratedError(message, retry_after=retry_after)
+            if classification == http_retry.SEND_PERMANENT:
+                raise WrapperError(message, code="upstream_error", retryable=False)
+            raise WrapperError(
+                f"{SEND_OUTCOME_UNKNOWN_MESSAGE}: {message}",
+                code="send_outcome_unknown",
+                retryable=False,
+            )
+        if http_retry.stderr_is_transient(message):
+            raise _RetryableGeneratedError(message, retry_after=retry_after)
         raise WrapperError(message, code="upstream_error", retryable=True)
+
+    try:
+        proc = http_retry.run(
+            _attempt,
+            retry_decision=_generated_retry_decision,
+            budget_seconds=None,
+            sleep=sleep,
+            random_fn=random_fn,
+        )
+    except _RetryableGeneratedError as exc:
+        raise WrapperError(
+            exc.message,
+            code="upstream_error",
+            retryable=True,
+            retry_after_seconds=exc.retry_after,
+        ) from exc
 
     try:
         result = json.loads(proc.stdout)
@@ -441,18 +507,22 @@ def emit_error(
     message: str,
     retryable: bool,
     meta_extra: dict[str, object] | None = None,
+    retry_after_seconds: float | None = None,
 ) -> None:
     resolved_code = code if code in ERROR_CODES else "internal_error"
+    error: dict[str, object] = {
+        "code": resolved_code,
+        "message": message,
+        "retryable": retryable,
+    }
+    if retry_after_seconds is not None:
+        error["retry_after_seconds"] = retry_after_seconds
     print(
         json.dumps(
             {
                 "ok": False,
                 "command": command,
-                "error": {
-                    "code": resolved_code,
-                    "message": message,
-                    "retryable": retryable,
-                },
+                "error": error,
                 "meta": build_meta(wrapper, meta_extra),
             },
             indent=2,
@@ -504,7 +574,15 @@ def handle_wrapper_exception(command: str, wrapper: str, err: Exception, json_mo
         else:
             code, retryable = classify_wrapper_error(str(err))
             meta_extra = err.meta if isinstance(err, WrapperError) else None
-        emit_error(command, wrapper, code, str(err), retryable, meta_extra=meta_extra)
+        emit_error(
+            command,
+            wrapper,
+            code,
+            str(err),
+            retryable,
+            meta_extra=meta_extra,
+            retry_after_seconds=getattr(err, "retry_after_seconds", None),
+        )
         return 2
 
     print_wrapper_error(err)

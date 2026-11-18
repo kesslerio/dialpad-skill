@@ -453,12 +453,20 @@ def _minute_ok(local_dt: datetime) -> bool:
     return local_dt.minute not in BLOCKED_MINUTES
 
 
-def _next_pass_seconds(now_utc: datetime, zones: list[ZoneInfo]) -> int | None:
-    """Seconds until every zone is inside the window at an allowed minute."""
+def _next_pass_seconds(
+    now_utc: datetime, zones: list[ZoneInfo], require_window: bool = True
+) -> int | None:
+    """Seconds until every zone is inside the window at an allowed minute.
+
+    With ``require_window=False`` only the blocked-minute rule applies (the
+    caller waived the advisory window), so the hint is the next minute every
+    zone passes ``_minute_ok``.
+    """
     candidate = now_utc.replace(second=0, microsecond=0) + timedelta(minutes=1)
     for _ in range(_RETRY_HORIZON_MINUTES):
         if all(
-            _window_ok(candidate.astimezone(zone)) and _minute_ok(candidate.astimezone(zone))
+            (not require_window or _window_ok(candidate.astimezone(zone)))
+            and _minute_ok(candidate.astimezone(zone))
             for zone in zones
         ):
             return int((candidate - now_utc).total_seconds())
@@ -631,7 +639,11 @@ def evaluate_send(
         )
 
     retryable = bool(time_reasons) and not hard_reasons
-    retry_after = _next_pass_seconds(now_utc, all_zones) if retryable else None
+    retry_after = (
+        _next_pass_seconds(now_utc, all_zones, require_window=not allow_outside_window)
+        if retryable
+        else None
+    )
     return _refuse(
         reasons,
         reason_codes=reason_codes,

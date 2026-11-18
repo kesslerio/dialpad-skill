@@ -621,6 +621,45 @@ class AdvisoryWindowTests(unittest.TestCase):
         self.assertNotIn("minute", decision.reasons[0])
         self.assertEqual(decision.overrides, [])
 
+    def test_overridden_blocked_minute_retry_hint_ignores_window_after_close(self):
+        # 05:00 UTC = 21:00 Pacific: blocked :00 just past the window close.
+        # The identical overridden call passes at :01, so the hint is 60s,
+        # not the 39660s until the next in-window allowed minute.
+        decision = _evaluate(
+            now_utc=datetime(2026, 1, 16, 5, 0, 0, tzinfo=timezone.utc),
+            allow_outside_window=True,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertTrue(decision.retryable)
+        self.assertEqual(decision.reason_codes, [send_gate.CODE_BLOCKED_MINUTE])
+        self.assertEqual(decision.overrides, [send_gate.CODE_OUTSIDE_RECOMMENDED_WINDOW])
+        self.assertEqual(decision.retry_after_seconds, 60)
+
+    def test_overridden_blocked_minute_retry_hint_ignores_window_before_open(self):
+        # 15:00 UTC = 07:00 Pacific: same shape before the window opens.
+        decision = _evaluate(
+            now_utc=self.OUTSIDE_BLOCKED_MINUTE_UTC,
+            allow_outside_window=True,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertTrue(decision.retryable)
+        self.assertEqual(decision.reason_codes, [send_gate.CODE_BLOCKED_MINUTE])
+        self.assertEqual(decision.retry_after_seconds, 60)
+
+    def test_blocked_minute_retry_hint_unchanged_without_override(self):
+        # Without the waiver the hint still waits for the next in-window
+        # allowed minute: 08:01 Pacific after 07:00, and after 21:00.
+        early = _evaluate(now_utc=self.OUTSIDE_BLOCKED_MINUTE_UTC)
+        self.assertFalse(early.allowed)
+        self.assertTrue(early.retryable)
+        self.assertEqual(early.reason_codes, [send_gate.CODE_OUTSIDE_RECOMMENDED_WINDOW])
+        self.assertEqual(early.retry_after_seconds, 3660)
+        late = _evaluate(now_utc=datetime(2026, 1, 16, 5, 0, 0, tzinfo=timezone.utc))
+        self.assertFalse(late.allowed)
+        self.assertTrue(late.retryable)
+        self.assertEqual(late.reason_codes, [send_gate.CODE_OUTSIDE_RECOMMENDED_WINDOW])
+        self.assertEqual(late.retry_after_seconds, 39660)
+
     def test_time_restricted_false_caller_stays_unrestricted_with_flag(self):
         # operator carries time_restricted: false — the flag changes nothing
         # and no override is recorded because the window check never ran.

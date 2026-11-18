@@ -224,11 +224,55 @@ Tools (each with `additionalProperties: false`; unknown args error):
 - `read_thread(contact, limit?, line?)` — messages with a contact on the
   caller's allowed lines; `line` narrows to one allowed line and a
   non-allowed line is an error, not an empty result.
+- `list_calls(line?, since?, until?, limit?)` — read-only call list from
+  `GET /api/v2/call` (newest first), filtered to the caller's allowed lines.
+  `line` takes a +1 E.164 or a gate-config line name (office/sales, a
+  teammate name, `own`); a non-allowed line is a `line_not_allowed` error.
+  `since`/`until` accept ISO-8601 or epoch ms/s (defaults: now-7d/now);
+  `limit` is 1-100 (default 20). Returns `scanned` (raw calls examined),
+  `truncated` (the 12-page/300-call scan cap was hit before the limit
+  filled), and `lines` (lines searched). Never returns recording or
+  voicemail URLs.
+- `get_call(call_id, include?, summary_format?)` — read-only detail for one
+  call: the same summary fields plus `transcript` (lines + moments),
+  `recording` (urls), and `recap` (AI summary/action items/purposes/
+  disposition), each included on request (default all) and each degrading to
+  `{available: false, reason, message, retryable}` on its own failure —
+  404 is `not_available`, 403 `not_permitted`, 429 (and Dialpad's HTTP-400
+  `rate_limit_exceeded`) `rate_limited`, anything else `upstream_error`.
+  `summary_format` is short|medium|long|bullet and only rides on the recap
+  request. Only the initial `GET /call/{id}` lookup is a hard error.
 - `set_sms_alert_url(url, key)` — registers this caller's alert webhook:
   HTTPS only (loopback HTTP for tests), host must match
   `alerts.allowed_url_hosts` when configured, no IP literals or userinfo.
   Stored mode 0600 in the alerts store; the key is never echoed. Empty `url`
   clears the registration. The response lists which lines will alert.
+
+Call scoping (both call tools, re-evaluated per request from the raw
+response — the upstream TTL cache never caches an allow decision): a call
+belongs to the lines `{internal_number, entry_point_target.phone}`
+normalized to 10-digit keys. A caller sees it only when at least one of
+those lines is in its allowed set and none of them is the support line.
+Calls to the office/sales shared lines that are forwarded to a teammate
+carry `internal_number` = the teammate's direct line and
+`entry_point_target.phone` = the shared line, so a caller holding the
+shared-line grant sees them via the entry point, while a call on a
+teammate's direct line that never came through a granted shared line is
+invisible to the others. `get_call` gives the same generic `call_not_found`
+refusal for a call on a non-allowed line and a nonexistent id — checked
+before any transcript/recording/recap fetch — so call ids cannot be probed
+across lines. Recording/voicemail URLs appear only inside `get_call`'s
+`recording` section for an allowed call, are never logged, and are never
+cached beyond the in-process upstream cache; they are permanent
+dialpad.com/blob links (no expiry parameter) that open only for a signed-in
+Dialpad user with access — not pre-signed URLs.
+
+The call tools are read-only (GET only; no dial/call/transfer/label verbs)
+and degrade cleanly: a missing `DIALPAD_API_KEY` (falls back to
+`DIALPAD_TOKEN`) makes them return `not_configured` while the rest of the
+server keeps working. Dialpad rate limits: `/call` list 1200/min (page size
+25, no `limit` param), `/call/{id}` 10/min and `ai_recap` 12/min — hence a
+300 s bounded in-process cache of raw upstream responses keyed by call id.
 
 Inbound SMS alerts (`scripts/team_alerts.py`, wired in
 `scripts/webhook_server.py` next to the existing `ops_wake.notify_sms_event`)

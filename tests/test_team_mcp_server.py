@@ -308,7 +308,14 @@ def test_initialize_tools_list_round_trip(server) -> None:
 
     response = json.load(_rpc(server, "tools/list"))
     tools = {tool["name"]: tool for tool in response["result"]["tools"]}
-    assert set(tools) == {"send_sms", "list_conversations", "read_thread", "set_sms_alert_url"}
+    assert set(tools) == {
+        "send_sms",
+        "list_conversations",
+        "read_thread",
+        "set_sms_alert_url",
+        "list_calls",
+        "get_call",
+    }
     for tool in tools.values():
         assert tool["inputSchema"]["additionalProperties"] is False
 

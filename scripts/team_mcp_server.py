@@ -17,8 +17,22 @@ line — with the support line removed everywhere.
 
 Tools: ``send_sms`` (the same gated ``bin/send_sms.py`` path the send API
 runs), ``list_conversations`` and ``read_thread`` against the read-only SMS
-SQLite store, and ``set_sms_alert_url`` (registers the webhook that
-``scripts/team_alerts.py`` posts inbound-SMS notices to).
+SQLite store, ``set_sms_alert_url`` (registers the webhook that
+``scripts/team_alerts.py`` posts inbound-SMS notices to), and the read-only
+call tools ``list_calls``/``get_call`` backed by ``scripts/team_calls.py``
+(GET-only Dialpad client, raw-response TTL cache, no write verbs).
+
+Call scoping mirrors the SMS line scope: a call belongs to the lines
+``{internal_number, entry_point_target.phone}`` and is visible to a caller
+only when at least one of those lines is in the caller's allowed set and
+none is the support line. Calls forwarded from a shared line to a teammate
+carry ``internal_number`` = the teammate's line and
+``entry_point_target.phone`` = the shared line, so a caller holding the
+shared-line grant sees them via the entry point while another teammate's
+direct-line call stays invisible. A disallowed call and a nonexistent call
+id get the same generic ``call_not_found`` refusal so call ids cannot be
+probed across lines. Recording/voicemail URLs only ever appear inside the
+``get_call`` recording section — never in list output and never logged.
 
 Stdlib only: the host Python carries no third-party packages.
 """
@@ -50,6 +64,7 @@ import send_gate
 import sms_approval
 import sms_sqlite
 import team_alerts
+import team_calls
 
 CONFIG_ENV = "DIALPAD_TEAM_MCP_CONFIG"
 BIND_ENV = "DIALPAD_TEAM_MCP_BIND"
@@ -65,7 +80,7 @@ MAX_KEY_CHARS = team_alerts.MAX_KEY_CHARS
 PREVIEW_CHARS = 120
 
 PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26")
-SERVER_INFO = {"name": "dialpad-team-mcp", "version": "1.0.0"}
+SERVER_INFO = {"name": "dialpad-team-mcp", "version": "1.1.0"}
 
 JWT_LEEWAY_SECONDS = 60
 JWKS_TTL_SECONDS = 3600
@@ -77,6 +92,10 @@ _TEAM_DOMAIN_RE = re.compile(
     r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$"
 )
 _B64URL_RE = re.compile(r"^[A-Za-z0-9_-]*$")
+
+CALLS_DEFAULT_WINDOW_MS = 7 * 24 * 3600 * 1000
+CALLS_MAX_LIST_PAGES = 12  # 12 pages * 25 = at most 300 raw calls scanned.
+_SUPPORT_LINE_KEY = sms_approval.normalize_phone_number(send_api_server.SUPPORT_LINE)
 
 RPC_PARSE_ERROR = -32700
 RPC_INVALID_REQUEST = -32600
@@ -454,6 +473,61 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "list_calls",
+        "description": (
+            "List recent calls on your allowed lines (your own line plus the shared lines granted "
+            "to you), newest first. Calls forwarded from a shared line to a teammate are visible to "
+            "callers holding that shared line. No recording or voicemail URLs are returned; use "
+            "get_call for those."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "line": {
+                    "type": "string",
+                    "description": "Restrict to one of your allowed lines: +1 E.164 or a line name (e.g. office, sales, own).",
+                },
+                "since": {
+                    "type": ["string", "integer"],
+                    "description": "Calls started at or after this time: ISO-8601 string or epoch ms (default: 7 days ago).",
+                },
+                "until": {
+                    "type": ["string", "integer"],
+                    "description": "Calls started at or before this time: ISO-8601 string or epoch ms (default: now).",
+                },
+                "limit": {"type": "integer", "description": "Max calls (default 20, max 100)."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "get_call",
+        "description": (
+            "Read one call by Dialpad call id on your allowed lines: the call summary plus, on "
+            "request, transcript lines and moments, recording/voicemail URLs, and the AI recap. "
+            "Calls on lines you cannot see and nonexistent ids get the same call_not_found refusal."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "call_id": {"type": ["string", "integer"], "description": "Dialpad call id (digits only)."},
+                "include": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": ["transcript", "recording", "recap"]},
+                    "description": "Sections to fetch; defaults to all three.",
+                },
+                "summary_format": {
+                    "type": "string",
+                    "enum": ["short", "medium", "long", "bullet"],
+                    "description": "AI recap summary format; defaults to the Dialpad default.",
+                },
+            },
+            "required": ["call_id"],
+        },
+    },
+    {
         "name": "set_sms_alert_url",
         "description": (
             "Register the webhook that receives a minimal notice when an SMS lands on your own line "
@@ -511,7 +585,7 @@ def _normalized_key(number: Any) -> str | None:
     return sms_approval.normalize_phone_number(number)
 
 
-def _parse_since(value: Any) -> int | None:
+def _parse_since(value: Any, *, name: str = "since") -> int | None:
     """`since` as epoch ms: ISO-8601 string or epoch number (ms, or s when small)."""
     if value is None:
         return None
@@ -526,12 +600,12 @@ def _parse_since(value: Any) -> int | None:
             try:
                 parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
             except ValueError as exc:
-                raise ToolError("invalid_argument", "since must be an ISO-8601 string or epoch ms") from exc
+                raise ToolError("invalid_argument", f"{name} must be an ISO-8601 string or epoch ms") from exc
             if parsed.tzinfo is None:
                 parsed = parsed.replace(tzinfo=timezone.utc)
             number = parsed.timestamp() * 1000
     if number is None or number <= 0:
-        raise ToolError("invalid_argument", "since must be an ISO-8601 string or epoch ms")
+        raise ToolError("invalid_argument", f"{name} must be an ISO-8601 string or epoch ms")
     # Dialpad stores epoch ms; accept epoch seconds for hand-typed values.
     if number < 100_000_000_000:
         number *= 1000
@@ -744,6 +818,195 @@ def _tool_read_thread(server: "TeamMcpServer", caller: str, args: dict[str, Any]
         "lines": sorted({message["line"] for message in messages}),
         "messages": messages,
     }
+
+
+def _calls_api_error(exc: team_calls.CallApiError) -> ToolError:
+    """Map a client failure to a tool error; a call 404 stays a generic refusal upstream."""
+    if exc.reason == "not_configured":
+        return ToolError("not_configured", str(exc))
+    if exc.reason == "rate_limited":
+        return ToolError("rate_limited", str(exc), retryable=True)
+    if exc.reason == "not_permitted":
+        return ToolError("not_permitted", str(exc), retryable=exc.retryable)
+    return ToolError("upstream_error", str(exc), retryable=exc.retryable)
+
+
+def _resolve_line_arg(server: "TeamMcpServer", caller: str, raw: Any) -> str:
+    """A `line` argument to a canonical E.164 within the caller's allowed set.
+
+    Accepts the same +1 E.164 form read_thread takes plus gate-config line
+    names (office/sales, a teammate name, or ``own`` for the caller's own
+    line); anything outside the allowed set refuses like read_thread does.
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        raise ToolError("invalid_argument", "line must be a +1 E.164 string or a line name")
+    text = raw.strip()
+    gate_config = server.gate_config() or {}
+    shared = gate_config.get("shared_lines") or {}
+    teammates = gate_config.get("teammates") or {}
+    if text in shared:
+        candidate = shared[text]
+    elif text in teammates:
+        candidate = teammates[text]
+    elif text == "own":
+        candidate = server.own_line_for(caller) or ""
+    else:
+        candidate = text
+    narrowed = send_gate._canonical_sender(candidate)
+    if narrowed not in server.allowed_lines(caller):
+        raise ToolError("line_not_allowed", "line is not one of your allowed lines")
+    return narrowed
+
+
+def _call_visible(call: Mapping[str, Any], search_keys: set[str]) -> bool:
+    """The call scoping rule: at least one searched line on the call, and the
+    support line never appears on it."""
+    keys = team_calls.call_lines(call)
+    return bool(keys) and _SUPPORT_LINE_KEY not in keys and bool(keys & search_keys)
+
+
+def _generic_call_refusal() -> ToolError:
+    """One identical refusal for "not on an allowed line" and "does not
+    exist", so call ids cannot be probed across lines."""
+    return ToolError("call_not_found", "call not found")
+
+
+def _fetch_call_section(fetch: Any, shape: Any) -> dict[str, Any]:
+    """Run an optional get_call section fetch; failures degrade instead of
+    failing the whole call."""
+    try:
+        payload = fetch()
+    except team_calls.CallApiError as exc:
+        return team_calls.unavailable_section(exc)
+    except Exception:  # noqa: BLE001 - a section failure degrades, never fails the call.
+        return {
+            "available": False,
+            "reason": "upstream_error",
+            "message": "section fetch failed",
+            "retryable": True,
+        }
+    try:
+        return shape(payload)
+    except Exception:  # noqa: BLE001 - a malformed section body degrades too.
+        return {
+            "available": False,
+            "reason": "upstream_error",
+            "message": "dialpad returned an unexpected section body",
+            "retryable": True,
+        }
+
+
+@_tool("list_calls")
+def _tool_list_calls(server: "TeamMcpServer", caller: str, args: dict[str, Any]) -> Any:
+    args = _check_args(args, allowed={"line", "since", "until", "limit"}, required=set())
+    limit = _bounded_limit(args.get("limit"), default=20, maximum=100)
+    since_ms = _parse_since(args.get("since"), name="since")
+    until_ms = _parse_since(args.get("until"), name="until")
+    now_ms = int(time.time() * 1000)
+    if since_ms is None:
+        since_ms = now_ms - CALLS_DEFAULT_WINDOW_MS
+    if until_ms is None:
+        until_ms = now_ms
+    if since_ms > until_ms:
+        raise ToolError("invalid_argument", "since must be at or before until")
+    narrowed: str | None = None
+    if args.get("line") is not None:
+        narrowed = _resolve_line_arg(server, caller, args["line"])
+    search_lines = {narrowed} if narrowed else server.allowed_lines(caller)
+    if not search_lines:
+        return {"calls": [], "scanned": 0, "truncated": False, "lines": []}
+    search_keys = {_normalized_key(line) for line in search_lines}
+    line_names = server.line_names()
+    results: list[dict[str, Any]] = []
+    scanned = 0
+    cursor: str | None = None
+    truncated = False
+    for _ in range(CALLS_MAX_LIST_PAGES):
+        try:
+            page = server.dialpad_calls.list_call_page(
+                started_after=since_ms, started_before=until_ms, cursor=cursor
+            )
+        except team_calls.CallApiError as exc:
+            raise _calls_api_error(exc) from exc
+        items = page.get("items") if isinstance(page, dict) else None
+        items = items if isinstance(items, list) else []
+        scanned += len(items)
+        for item in items:
+            if len(results) >= limit:
+                break
+            if not isinstance(item, dict) or not _call_visible(item, search_keys):
+                continue
+            results.append(team_calls.call_summary(item, line_names=line_names))
+        if len(results) >= limit:
+            break
+        cursor = page.get("cursor") if isinstance(page, dict) else None
+        if not cursor:
+            break
+    else:
+        # The page cap stopped the scan before the window was exhausted.
+        truncated = len(results) < limit
+    results.sort(key=lambda entry: entry.get("started_at") or "", reverse=True)
+    return {
+        "calls": results,
+        "scanned": scanned,
+        "truncated": truncated,
+        "lines": sorted(search_lines),
+    }
+
+
+@_tool("get_call")
+def _tool_get_call(server: "TeamMcpServer", caller: str, args: dict[str, Any]) -> Any:
+    args = _check_args(args, allowed={"call_id", "include", "summary_format"}, required={"call_id"})
+    raw_id = args["call_id"]
+    if _is_int(raw_id) and raw_id >= 0:
+        call_id = str(raw_id)
+    elif isinstance(raw_id, str) and raw_id.strip().isdigit():
+        call_id = raw_id.strip()
+    else:
+        raise ToolError("invalid_argument", "call_id must be a digits-only string or integer")
+    include_arg = args.get("include")
+    if include_arg is None:
+        include = set(team_calls.GET_CALL_SECTIONS)
+    elif isinstance(include_arg, list) and all(
+        isinstance(section, str) and section in team_calls.GET_CALL_SECTIONS for section in include_arg
+    ):
+        include = set(include_arg)
+    else:
+        raise ToolError(
+            "invalid_argument",
+            "include must be a list containing only: transcript, recording, recap",
+        )
+    summary_format = args.get("summary_format")
+    if summary_format is not None and summary_format not in team_calls.SUMMARY_FORMATS:
+        raise ToolError(
+            "invalid_argument",
+            "summary_format must be one of: short, medium, long, bullet",
+        )
+    client = server.dialpad_calls
+    try:
+        call = client.get_call(call_id)
+    except team_calls.CallApiError as exc:
+        if exc.reason == "not_found":
+            raise _generic_call_refusal() from exc
+        raise _calls_api_error(exc) from exc
+    # Scope BEFORE any transcript/recording/recap fetch so a call on a
+    # non-allowed line is refused identically to a nonexistent id.
+    allowed_keys = {_normalized_key(line) for line in server.allowed_lines(caller)}
+    if not _call_visible(call, allowed_keys):
+        raise _generic_call_refusal()
+    result: dict[str, Any] = {"call": team_calls.call_summary(call, line_names=server.line_names())}
+    if "transcript" in include:
+        result["transcript"] = _fetch_call_section(
+            lambda: client.get_transcript(call_id), team_calls.transcript_section
+        )
+    if "recording" in include:
+        result["recording"] = _fetch_call_section(lambda: call, team_calls.recording_section)
+    if "recap" in include:
+        result["recap"] = _fetch_call_section(
+            lambda: client.get_ai_recap(call_id, summary_format=summary_format),
+            team_calls.recap_section,
+        )
+    return result
 
 
 @_tool("set_sms_alert_url")
@@ -1013,9 +1276,11 @@ class TeamMcpServer(ThreadingHTTPServer):
         environ: Mapping[str, str] | None = None,
         send_runner: Any = None,
         jwks_fetcher: Any = None,
+        dialpad_client: Any = None,
     ) -> None:
         self.environ = os.environ if environ is None else environ
         self.send_runner = send_runner or send_api_server.default_send_runner
+        self.dialpad_calls = dialpad_client or team_calls.DialpadCallsClient(environ=self.environ)
         if config is not None:
             self._config: Any = _StaticSource(validate_mcp_config(config))
         else:
@@ -1144,6 +1409,15 @@ class TeamMcpServer(ThreadingHTTPServer):
         own = (gate_config.get("teammates") or {}).get(acts_for) if isinstance(acts_for, str) else None
         return send_gate._canonical_sender(own) if own else None
 
+    def line_names(self) -> dict[str, str]:
+        """Canonical E.164 -> gate-config name (office/sales or teammate name)."""
+        gate_config = self.gate_config() or {}
+        names: dict[str, str] = {}
+        for section in ("teammates", "shared_lines"):
+            for name, number in (gate_config.get(section) or {}).items():
+                names[send_gate._canonical_sender(number)] = name
+        return names
+
     def ro_db(self) -> sqlite3.Connection:
         conn = sqlite3.connect(f"file:{self.db_path.resolve()}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
@@ -1172,6 +1446,7 @@ def create_server(
     tokens_path: str | Path | None = None,
     send_runner: Any = None,
     jwks_fetcher: Any = None,
+    dialpad_client: Any = None,
     env: Mapping[str, str] | None = None,
 ) -> TeamMcpServer:
     environ = os.environ if env is None else env
@@ -1188,6 +1463,7 @@ def create_server(
         environ=environ,
         send_runner=send_runner,
         jwks_fetcher=jwks_fetcher,
+        dialpad_client=dialpad_client,
     )
 
 

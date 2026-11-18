@@ -203,7 +203,7 @@ def test_unknown_routes_and_methods(server) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("extra", [{"caller": "operator"}, {"acting_for": "scott"}, {"caller_id": "x"}, {"verbose": True}])
+@pytest.mark.parametrize("extra", [{"caller": "operator"}, {"acting_for": "scott"}, {"caller_id": "x"}, {"verbose": True}, {"allow_outside_window": True}])
 def test_unknown_body_keys_rejected_and_runner_not_called(server, extra) -> None:
     with pytest.raises(urllib.error.HTTPError) as raised:
         _request(server, "/v1/sms/send", body={**SEND_BODY, **extra})
@@ -330,6 +330,82 @@ def test_gate_refusal_maps_to_422_with_gate_details(make_server) -> None:
     assert body["error"]["reasons"] == [
         "recipient +13105550100 outside send window: 22:40 local (America/Los_Angeles)"
     ]
+
+
+def test_gate_refusal_forwards_reason_codes(make_server) -> None:
+    envelope = {
+        "ok": False,
+        "command": "send_sms.send",
+        "error": {"code": "send_gate_refused", "message": "Send gate refused: ...", "retryable": True},
+        "meta": {
+            "send_gate": {
+                "allowed": False,
+                "reasons": [
+                    "outside_recommended_window: recipient +13105550100 is at 22:40 local "
+                    "(America/Los_Angeles); the recommended send window is 08:00-21:00 "
+                    "recipient-local; pass allow_outside_window=true to send anyway"
+                ],
+                "reason_codes": ["outside_recommended_window"],
+                "retryable": True,
+                "retry_after_seconds": 300,
+                "caller": "team-scott",
+            }
+        },
+    }
+    server = make_server(runner=RecordingRunner(envelope=envelope))
+    with pytest.raises(urllib.error.HTTPError) as raised:
+        _request(server, "/v1/sms/send", body=dict(SEND_BODY))
+    assert raised.value.code == 422
+    body = _error_body(raised.value)
+    assert body["error"]["code"] == "send_gate_refused"
+    assert body["error"]["reason_codes"] == ["outside_recommended_window"]
+    assert body["error"]["send_gate"]["reason_codes"] == ["outside_recommended_window"]
+
+
+def test_execute_gated_send_appends_allow_outside_window_flag() -> None:
+    runner = RecordingRunner()
+    send_api_server.execute_gated_send(
+        to="+13105550100",
+        from_number="+14159065785",
+        message="hi",
+        caller="team-scott",
+        dry_run=True,
+        environ={},
+        send_runner=runner,
+        allow_outside_window=True,
+    )
+    argv = runner.calls[0]["argv"]
+    assert "--allow-outside-window" in argv
+    assert "--dry-run" in argv
+
+    runner2 = RecordingRunner()
+    send_api_server.execute_gated_send(
+        to="+13105550100",
+        from_number="+14159065785",
+        message="hi",
+        caller="team-scott",
+        dry_run=True,
+        environ={},
+        send_runner=runner2,
+    )
+    assert "--allow-outside-window" not in runner2.calls[0]["argv"]
+
+
+def test_success_data_forwards_send_gate_overrides(make_server) -> None:
+    envelope = {
+        "ok": True,
+        "command": "send_sms.send",
+        "data": {
+            "mode": "real_send",
+            "id": "msg-1",
+            "send_gate": {"allowed": True, "overrides": ["outside_recommended_window"]},
+        },
+        "meta": {},
+    }
+    server = make_server(runner=RecordingRunner(envelope=envelope))
+    response = json.load(_request(server, "/v1/sms/send", body=dict(SEND_BODY)))
+    assert response["ok"] is True
+    assert response["data"]["send_gate"]["overrides"] == ["outside_recommended_window"]
 
 
 def test_unparseable_child_output_real_send_is_unknown_outcome(make_server) -> None:

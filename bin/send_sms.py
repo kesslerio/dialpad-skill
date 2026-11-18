@@ -76,6 +76,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--infer-country-code", action="store_true", help="Infer country code from sender")
     parser.add_argument("--dry-run", action="store_true", help="Print request and selected sender without sending")
     parser.add_argument(
+        "--allow-outside-window",
+        action="store_true",
+        help="Send anyway when the recipient is outside the recommended 08:00-21:00 local send window",
+    )
+    parser.add_argument(
         "--allow-suspicious-currency",
         action="store_true",
         help="Bypass malformed-currency preflight for intentionally unusual numeric text",
@@ -220,12 +225,14 @@ def evaluate_send_gate(
     caller: str | None,
     from_number: str,
     to_numbers: list[str],
+    allow_outside_window: bool = False,
 ) -> "send_gate.Decision":
     """Evaluate the send gate for this send; no provider call may precede it."""
     return send_gate.evaluate_from_environment(
         caller=caller,
         from_number=from_number,
         to_numbers=to_numbers,
+        allow_outside_window=allow_outside_window,
     )
 
 
@@ -451,8 +458,20 @@ def main() -> int:
         message_text, message_source = resolve_message_text(args)
         validate_message_text(message_text, args.allow_suspicious_currency)
         gate_caller = (args.caller or os.environ.get(send_gate.CALLER_ENV) or "").strip() or None
-        gate = evaluate_send_gate(caller=gate_caller, from_number=sender_number, to_numbers=args.to)
+        gate = evaluate_send_gate(
+            caller=gate_caller,
+            from_number=sender_number,
+            to_numbers=args.to,
+            allow_outside_window=args.allow_outside_window,
+        )
         set_receipt_context(gate.receipt_context())
+        if gate.overrides:
+            print(
+                f"send gate override used: {','.join(gate.overrides)} "
+                f"caller={gate.caller or gate_caller or '-'} "
+                f"to_tail={','.join(number[-4:] for number in args.to)}",
+                file=sys.stderr,
+            )
         _require_send_gate(gate)
         approval_preflight = preflight_approval_audit(args, sender_number=sender_number, message_text=message_text)
         payload = _build_payload(args.to, message_text, args.infer_country_code, sender_number)
@@ -548,10 +567,16 @@ def main() -> int:
         annotated_result = attach_approval_audit(result, approval_audit)
 
         if json_mode:
+            emit_data = (
+                annotate_message_status(annotated_result)
+                if isinstance(annotated_result, dict)
+                else {"result": annotated_result}
+            )
+            emit_data["send_gate"] = gate.public()
             emit_success(
                 command,
                 wrapper,
-                annotate_message_status(annotated_result) if isinstance(annotated_result, dict) else {"result": annotated_result},
+                emit_data,
                 meta_extra=combined_meta or None,
             )
         else:

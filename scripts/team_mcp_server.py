@@ -420,8 +420,11 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "name": "send_sms",
         "description": (
             "Send an SMS from one of your Dialpad lines (your own line by default) through the team "
-            "send gate. The gate enforces allowed lines, opt-out (STOP) lists, and the 08:00-21:00 "
-            "recipient-local send window; a refusal returns error details instead of sending."
+            "send gate. The gate enforces allowed lines, opt-out (STOP) lists, and the "
+            ":00/:15/:30/:45 minute rule — all hard checks. The 08:00-21:00 recipient-local send "
+            "window is the recommended default: a refusal carrying the outside_recommended_window "
+            "reason code can be retried with allow_outside_window=true when the person explicitly "
+            "wants to send at that hour. A refusal returns error details instead of sending."
         ),
         "inputSchema": {
             "type": "object",
@@ -434,6 +437,10 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "description": "From line as +1 E.164; defaults to your own line. Must be one of your allowed lines.",
                 },
                 "dry_run": {"type": "boolean", "description": "Evaluate the gate without sending."},
+                "allow_outside_window": {
+                    "type": "boolean",
+                    "description": "Send anyway when the recipient is outside the recommended 08:00-21:00 recipient-local window.",
+                },
             },
             "required": ["to", "message"],
         },
@@ -627,7 +634,11 @@ def _iso_from_ms(value: Any) -> str | None:
 
 @_tool("send_sms")
 def _tool_send_sms(server: "TeamMcpServer", caller: str, args: dict[str, Any]) -> Any:
-    args = _check_args(args, allowed={"to", "message", "from", "dry_run"}, required={"to", "message"})
+    args = _check_args(
+        args,
+        allowed={"to", "message", "from", "dry_run", "allow_outside_window"},
+        required={"to", "message"},
+    )
     to = args["to"]
     if not isinstance(to, str) or not outbound_destination_policy.is_supported_outbound_destination(to.strip()):
         raise ToolError("invalid_argument", "to must be a single +1 E.164 number")
@@ -649,6 +660,9 @@ def _tool_send_sms(server: "TeamMcpServer", caller: str, args: dict[str, Any]) -
     dry_run = args.get("dry_run", False)
     if not isinstance(dry_run, bool):
         raise ToolError("invalid_argument", "dry_run must be a boolean")
+    allow_outside_window = args.get("allow_outside_window", False)
+    if not isinstance(allow_outside_window, bool):
+        raise ToolError("invalid_argument", "allow_outside_window must be a boolean")
     if send_api_server._is_support_line(to) or send_api_server._is_support_line(from_number):
         raise ToolError("support_line_refused", "the support line cannot be a send endpoint")
     _status, payload = send_api_server.execute_gated_send(
@@ -660,6 +674,7 @@ def _tool_send_sms(server: "TeamMcpServer", caller: str, args: dict[str, Any]) -
         environ=server.environ,
         send_runner=server.send_runner,
         command="team_mcp.send_sms",
+        allow_outside_window=allow_outside_window,
     )
     if payload.get("ok"):
         return payload.get("data")
@@ -668,8 +683,38 @@ def _tool_send_sms(server: "TeamMcpServer", caller: str, args: dict[str, Any]) -
         str(error.get("code") or "upstream_error"),
         str(error.get("message") or "send failed"),
         retryable=bool(error.get("retryable")),
-        extra={key: error[key] for key in ("reasons", "retry_after_seconds", "send_gate") if key in error},
+        extra={
+            key: error[key]
+            for key in ("reasons", "reason_codes", "retry_after_seconds", "send_gate")
+            if key in error
+        },
     )
+
+
+def _send_override_note(name: str, arguments: Any, data: Any) -> str:
+    """Audit-log marker when ``send_sms`` requested or used the window override.
+
+    ``override=<code>`` when the gate waived the window for real;
+    ``override_requested=<code>`` when the flag was passed but the send was
+    inside the window (or never reached the gate). No message content.
+    """
+    if name != "send_sms" or not isinstance(arguments, dict):
+        return ""
+    if arguments.get("allow_outside_window") is not True:
+        return ""
+    gate: dict[str, Any] = {}
+    if isinstance(data, dict):
+        candidate = data.get("send_gate")
+        if isinstance(candidate, dict):
+            gate = candidate
+        else:
+            error = data.get("error")
+            if isinstance(error, dict) and isinstance(error.get("send_gate"), dict):
+                gate = error["send_gate"]
+    overrides = gate.get("overrides") or []
+    if overrides:
+        return " override=" + ",".join(str(item) for item in overrides)
+    return " override_requested=outside_recommended_window"
 
 
 @_tool("list_conversations")
@@ -1063,8 +1108,8 @@ class TeamMcpRequestHandler(BaseHTTPRequestHandler):
         # numbers and message text.
         return
 
-    def _log(self, *, caller: str | None, action: str, outcome: str) -> None:
-        sys.stderr.write(f"team_mcp caller={caller or '-'} action={action} outcome={outcome}\n")
+    def _log(self, *, caller: str | None, action: str, outcome: str, extra: str = "") -> None:
+        sys.stderr.write(f"team_mcp caller={caller or '-'} action={action} outcome={outcome}{extra}\n")
 
     def _write_json(self, status: int, payload: dict[str, Any]) -> None:
         encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
@@ -1248,7 +1293,12 @@ class TeamMcpRequestHandler(BaseHTTPRequestHandler):
                 data = {"error": {"code": "internal_error", "message": "tool failed", "retryable": False}}
                 outcome = "internal_error"
                 is_error = True
-            self._log(caller=caller, action=f"tool:{name}", outcome=outcome)
+            self._log(
+                caller=caller,
+                action=f"tool:{name}",
+                outcome=outcome,
+                extra=_send_override_note(name, arguments, data),
+            )
             return {
                 "content": [{"type": "text", "text": json.dumps(data, separators=(",", ":"))}],
                 "isError": is_error,

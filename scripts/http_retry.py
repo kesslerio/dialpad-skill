@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Bounded full-jitter retry helpers for the Dialpad HTTP clients.
 
-Reads are idempotent and get bounded retries; the send path is not idempotent
-and retries only failures that provably happened before the request was
-accepted (the SAFE-RETRY rule in :func:`classify_send_stderr` and
-:func:`send_url_error_safe`). Sleep, monotonic, and randomness are injected so
-tests stay instant.
+Reads are idempotent and get bounded retries; requests that may create an
+effect are not idempotent and retry only failures that provably happened
+before the request was accepted (the SAFE-RETRY rule in
+:func:`classify_request_stderr` and :func:`send_url_error_safe`). Sleep,
+monotonic, and randomness are injected so tests stay instant.
 """
 
 from __future__ import annotations
@@ -151,23 +151,24 @@ def run(
 
 
 # --------------------------------------------------------------------------
-# SAFE-RETRY classification for sends.
+# SAFE-RETRY classification for non-idempotent requests.
 #
-# SMS send is not idempotent: a retry is only allowed when the request
-# provably never reached Dialpad. The safe markers are connect-stage failures
-# (DNS, refused connection, connect timeout, NewConnectionError) or an HTTP
-# 429, which rejects the request before accepting it. Anything after request
-# bytes may have gone out — read timeout, reset/disconnect mid-flight, any
-# 5xx — is outcome_unknown: Dialpad may have queued the message, so a blind
-# retry could double-send. A 4xx other than 429 is permanent: the server
-# rejected the request, so it was definitively not queued.
+# A request that may create an effect — an SMS send, an outbound call, a
+# create/update/delete — is not idempotent: a retry is only allowed when the
+# request provably never reached Dialpad. The safe markers are connect-stage
+# failures (DNS, refused connection, connect timeout, NewConnectionError) or
+# an HTTP 429, which rejects the request before accepting it. Anything after
+# request bytes may have gone out — read timeout, reset/disconnect mid-flight,
+# any 5xx — is outcome_unknown: Dialpad may have applied it, so a blind retry
+# could double the effect. A 4xx other than 429 is permanent: the server
+# rejected the request, so it was definitively not applied.
 # --------------------------------------------------------------------------
 
-SEND_SAFE_RETRY = "safe_retry"
-SEND_PERMANENT = "permanent"
-SEND_OUTCOME_UNKNOWN = "outcome_unknown"
+SAFE_RETRY = "safe_retry"
+PERMANENT = "permanent"
+OUTCOME_UNKNOWN = "outcome_unknown"
 
-_SEND_SAFE_MARKERS = (
+_SAFE_RETRY_MARKERS = (
     "429 client error",
     "429 too many requests",
     "newconnectionerror",
@@ -182,7 +183,7 @@ _SEND_SAFE_MARKERS = (
     "temporary failure in name resolution",
 )
 
-_SEND_UNKNOWN_MARKERS = (
+_OUTCOME_UNKNOWN_MARKERS = (
     "read timed out",
     "readtimeout",
     "remotedisconnected",
@@ -198,8 +199,8 @@ _SEND_UNKNOWN_MARKERS = (
 _STATUS_RE = re.compile(r"(\d{3})\s+(?:client|server) error", re.IGNORECASE)
 
 
-def classify_send_stderr(text: str) -> str:
-    """Classify a generated-CLI send failure under the SAFE-RETRY rule.
+def classify_request_stderr(text: str) -> str:
+    """Classify a generated-CLI write failure under the SAFE-RETRY rule.
 
     The generated CLI prints ``Error: <requests exception>`` on stderr, so the
     classifier works on requests/urllib3 exception text:
@@ -207,38 +208,38 @@ def classify_send_stderr(text: str) -> str:
     - ``safe_retry``: provably not accepted — HTTP 429 or a connect-stage
       failure before any request bytes were sent.
     - ``permanent``: the server rejected the request with a non-429 4xx — it
-      was seen and refused, so it is definitively not queued.
+      was seen and refused, so it is definitively not applied.
     - ``outcome_unknown``: anything else. Unrecognized failures stay here on
-      purpose: a send failure that cannot be classified never claims the
-      message was not sent.
+      purpose: a failure that cannot be classified never claims the request
+      was not applied.
     """
     lowered = (text or "").lower()
-    for marker in _SEND_SAFE_MARKERS:
+    for marker in _SAFE_RETRY_MARKERS:
         if marker in lowered:
-            return SEND_SAFE_RETRY
-    for marker in _SEND_UNKNOWN_MARKERS:
+            return SAFE_RETRY
+    for marker in _OUTCOME_UNKNOWN_MARKERS:
         if marker in lowered:
-            return SEND_OUTCOME_UNKNOWN
+            return OUTCOME_UNKNOWN
     status_match = _STATUS_RE.search(lowered)
     if status_match:
         code = int(status_match.group(1))
         if code == 429:
-            return SEND_SAFE_RETRY
+            return SAFE_RETRY
         if 400 <= code < 500:
-            return SEND_PERMANENT
-        return SEND_OUTCOME_UNKNOWN
-    return SEND_OUTCOME_UNKNOWN
+            return PERMANENT
+        return OUTCOME_UNKNOWN
+    return OUTCOME_UNKNOWN
 
 
 def stderr_is_transient(text: str) -> bool:
     """Whether generated-CLI stderr looks like a transient upstream failure.
 
-    Used for non-send generated commands, which may retry on any retryable
+    Used for idempotent generated reads, which may retry on any retryable
     failure: every connect-stage and post-connect transient marker, any 429,
     and any 5xx. 4xx and unrecognized text do not retry.
     """
     lowered = (text or "").lower()
-    if any(marker in lowered for marker in _SEND_SAFE_MARKERS + _SEND_UNKNOWN_MARKERS):
+    if any(marker in lowered for marker in _SAFE_RETRY_MARKERS + _OUTCOME_UNKNOWN_MARKERS):
         return True
     status_match = _STATUS_RE.search(lowered)
     return bool(status_match and int(status_match.group(1)) >= 500)

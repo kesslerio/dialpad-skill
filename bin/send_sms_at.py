@@ -226,11 +226,11 @@ def _run() -> int:
                 retryable=False,
             )
             return 2
-        data = {"status": "sent", "send": envelope}
+        data = {"status": "dry_run" if args.dry_run else "sent", "send": envelope}
         if json_mode:
             emit_success(COMMAND, WRAPPER, data)
         else:
-            print("Scheduled SMS sent")
+            print("Scheduled SMS dry run" if args.dry_run else "Scheduled SMS sent")
             sys.stdout.write(proc.stdout)
         return 0
     except WrapperError as err:

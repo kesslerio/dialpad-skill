@@ -68,10 +68,6 @@ def _candidate_ledger_paths() -> list[Path]:
     return candidates
 
 
-def _ledger_path() -> Path:
-    return _candidate_ledger_paths()[0]
-
-
 def extract_send_result(result: Any) -> tuple[str | None, str | None]:
     if not isinstance(result, dict):
         return None, "unknown"

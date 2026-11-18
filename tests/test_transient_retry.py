@@ -128,29 +128,29 @@ class HttpRetryHelperTests(unittest.TestCase):
 
 class SendClassifierTests(unittest.TestCase):
     CASES = [
-        ("429 Client Error: Too Many Requests for url: https://dialpad.com/api/v2/sms", http_retry.SEND_SAFE_RETRY),
-        ("NewConnectionError: Failed to establish a new connection: [Errno 111] Connection refused", http_retry.SEND_SAFE_RETRY),
-        ("ConnectTimeoutError: connect timeout", http_retry.SEND_SAFE_RETRY),
-        ("Name or service not known", http_retry.SEND_SAFE_RETRY),
-        ("Connection refused", http_retry.SEND_SAFE_RETRY),
-        ("Read timed out. (read timeout=30)", http_retry.SEND_OUTCOME_UNKNOWN),
-        ("RemoteDisconnected('Remote end closed connection without response')", http_retry.SEND_OUTCOME_UNKNOWN),
-        ("ConnectionResetError: connection reset by peer", http_retry.SEND_OUTCOME_UNKNOWN),
-        ("503 Server Error: Service Unavailable", http_retry.SEND_OUTCOME_UNKNOWN),
-        ("500 Server Error: Internal Server Error", http_retry.SEND_OUTCOME_UNKNOWN),
-        ("400 Client Error: Bad Request", http_retry.SEND_PERMANENT),
-        ("401 Client Error: Unauthorized", http_retry.SEND_PERMANENT),
-        ("403 Client Error: Forbidden", http_retry.SEND_PERMANENT),
-        ("something entirely unexpected", http_retry.SEND_OUTCOME_UNKNOWN),
+        ("429 Client Error: Too Many Requests for url: https://dialpad.com/api/v2/sms", http_retry.SAFE_RETRY),
+        ("NewConnectionError: Failed to establish a new connection: [Errno 111] Connection refused", http_retry.SAFE_RETRY),
+        ("ConnectTimeoutError: connect timeout", http_retry.SAFE_RETRY),
+        ("Name or service not known", http_retry.SAFE_RETRY),
+        ("Connection refused", http_retry.SAFE_RETRY),
+        ("Read timed out. (read timeout=30)", http_retry.OUTCOME_UNKNOWN),
+        ("RemoteDisconnected('Remote end closed connection without response')", http_retry.OUTCOME_UNKNOWN),
+        ("ConnectionResetError: connection reset by peer", http_retry.OUTCOME_UNKNOWN),
+        ("503 Server Error: Service Unavailable", http_retry.OUTCOME_UNKNOWN),
+        ("500 Server Error: Internal Server Error", http_retry.OUTCOME_UNKNOWN),
+        ("400 Client Error: Bad Request", http_retry.PERMANENT),
+        ("401 Client Error: Unauthorized", http_retry.PERMANENT),
+        ("403 Client Error: Forbidden", http_retry.PERMANENT),
+        ("something entirely unexpected", http_retry.OUTCOME_UNKNOWN),
     ]
 
     def test_classifier_table(self):
         for text, expected in self.CASES:
             self.assertEqual(
-                http_retry.classify_send_stderr(text), expected, f"stderr: {text!r}"
+                http_retry.classify_request_stderr(text), expected, f"stderr: {text!r}"
             )
 
-    def test_stderr_is_transient_for_non_send(self):
+    def test_stderr_is_transient_for_reads(self):
         self.assertTrue(http_retry.stderr_is_transient("503 Server Error"))
         self.assertTrue(http_retry.stderr_is_transient("connect timeout"))
         self.assertFalse(http_retry.stderr_is_transient("400 Client Error"))
@@ -386,6 +386,94 @@ class RunGeneratedJsonSendTests(unittest.TestCase):
         self.assertEqual(result, {"items": []})
         self.assertEqual(calls["n"], 2)
 
+    def test_call_call_read_timeout_is_outcome_unknown_no_retry(self):
+        # #170: call.call places a real phone call — a post-acceptance failure
+        # must not blind-retry into a duplicate call.
+        proc = self._proc(1, stderr="Error: Read timed out. (read timeout=30)")
+        calls = {"n": 0}
+
+        def fake(cmd, capture_output=False):
+            calls["n"] += 1
+            return proc
+
+        with patch.object(_dialpad_compat, "run_generated", side_effect=fake):
+            with self.assertRaises(WrapperError) as ctx:
+                _dialpad_compat.run_generated_json(["call", "call.call", "--data", "{}"], sleep=lambda s: None)
+        self.assertEqual(ctx.exception.code, "send_outcome_unknown")
+        self.assertFalse(ctx.exception.retryable)
+        self.assertIn("verify before repeating", str(ctx.exception))
+        self.assertEqual(calls["n"], 1)
+
+    def test_call_call_connect_error_retries_then_succeeds(self):
+        results = [
+            self._proc(1, stderr="NewConnectionError: Failed to establish a new connection: [Errno 111] Connection refused"),
+            self._proc(0, stdout='{"call_id": "c-1"}'),
+        ]
+        calls = {"n": 0}
+
+        def fake(cmd, capture_output=False):
+            calls["n"] += 1
+            return results.pop(0)
+
+        with patch.object(_dialpad_compat, "run_generated", side_effect=fake):
+            result = _dialpad_compat.run_generated_json(["call", "call.call", "--data", "{}"], sleep=lambda s: None)
+        self.assertEqual(result, {"call_id": "c-1"})
+        self.assertEqual(calls["n"], 2)
+
+    def test_flag_only_writes_are_outcome_unknown_no_retry(self):
+        # #170: webhooks.create / stats.create / *.delete carry flags, not
+        # --data — still non-idempotent writes under the SAFE-RETRY rule.
+        proc = self._proc(1, stderr="RemoteDisconnected('Remote end closed connection without response')")
+        for args in (
+            ["webhook", "create", "--hook-url", "https://example.invalid/hook"],
+            ["stats", "stats.create", "--export-type", "sms", "--stat-type", "calls"],
+            ["webhooks", "webhooks.delete", "--id", "7"],
+        ):
+            calls = {"n": 0}
+
+            def fake(cmd, capture_output=False):
+                calls["n"] += 1
+                return proc
+
+            with patch.object(_dialpad_compat, "run_generated", side_effect=fake):
+                with self.assertRaises(WrapperError) as ctx:
+                    _dialpad_compat.run_generated_json(args, sleep=lambda s: None)
+            self.assertEqual(ctx.exception.code, "send_outcome_unknown", args)
+            self.assertFalse(ctx.exception.retryable, args)
+            self.assertIn("verify before repeating", str(ctx.exception), args)
+            self.assertEqual(calls["n"], 1, args)
+
+    def test_write_4xx_is_permanent_no_retry(self):
+        proc = self._proc(1, stderr="400 Client Error: Bad Request")
+        calls = {"n": 0}
+
+        def fake(cmd, capture_output=False):
+            calls["n"] += 1
+            return proc
+
+        with patch.object(_dialpad_compat, "run_generated", side_effect=fake):
+            with self.assertRaises(WrapperError) as ctx:
+                _dialpad_compat.run_generated_json(["call", "call.call", "--data", "{}"], sleep=lambda s: None)
+        self.assertEqual(ctx.exception.code, "upstream_error")
+        self.assertFalse(ctx.exception.retryable)
+        self.assertEqual(calls["n"], 1)
+
+    def test_read_command_read_timeout_still_retries(self):
+        results = [
+            self._proc(1, stderr="Error: Read timed out. (read timeout=30)"),
+            self._proc(0, stdout='{"items": []}'),
+        ]
+        calls = {"n": 0}
+
+        def fake(cmd, capture_output=False):
+            calls["n"] += 1
+            return results.pop(0)
+
+        with patch.object(_dialpad_compat, "run_generated", side_effect=fake):
+            result = _dialpad_compat.run_generated_json(["stats", "stats.get", "--id", "1"], sleep=lambda s: None)
+        self.assertEqual(result, {"items": []})
+        self.assertEqual(calls["n"], 2)
+
     def test_exhausted_send_retries_surface_retryable_with_retry_after(self):
         proc = self._proc(1, stderr='429 Client Error: Too Many Requests, Retry-After: 120')
         with patch.object(_dialpad_compat, "run_generated", return_value=proc):
@@ -599,6 +687,20 @@ class SendSmsAtCliTests(unittest.TestCase):
         self.assertIn("--to", send_argv)
         self.assertIn("+12125550100", send_argv)
         self.assertIn("--json", send_argv)
+
+    def test_dry_run_status_is_dry_run_not_sent(self):
+        summary = {"messages": []}
+        env = {"ok": True, "command": "send_sms.send", "data": {"mode": "dry_run"}, "meta": {}}
+        proc = subprocess.CompletedProcess(args=[], returncode=0, stdout=json.dumps(env), stderr="")
+        with patch.object(list_sms_thread, "read_thread_summary", return_value=(summary, None)), \
+                patch.object(send_sms_at.subprocess, "run", return_value=proc) as sub:
+            code, out, _ = self._run(
+                self.BASE + ["--at", "2000-01-05 10:07", "--tz", "America/New_York", "--dry-run", "--json"]
+            )
+        self.assertEqual(code, 0)
+        parsed = json.loads(out)
+        self.assertEqual(parsed["data"]["status"], "dry_run")
+        self.assertIn("--dry-run", sub.call_args[0][0])
 
     def test_subprocess_failure_relays_error_envelope(self):
         summary = {"messages": []}

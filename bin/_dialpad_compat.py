@@ -121,6 +121,7 @@ ERROR_CODES = {
     "internal_error",
 }
 SEND_OUTCOME_UNKNOWN_MESSAGE = "send outcome unknown; check the thread before resending"
+REQUEST_OUTCOME_UNKNOWN_MESSAGE = "request outcome unknown; verify before repeating"
 E164_RE = re.compile(r"^\+\d{7,15}$")
 _RECEIPT_SOURCE: str | None = None
 _RECEIPT_STATUS: str | None = None
@@ -300,8 +301,25 @@ def run_generated(args: list[str], capture_output: bool = False) -> subprocess.C
 
 
 
+_READ_VERBS = {"get", "list", "lookup"}
+
+
 def _is_sms_send_command(args: list[str]) -> bool:
     return len(args) >= 4 and args[0:2] == ["sms", "send"] and "--data" in args
+
+
+def _is_read_command(args: list[str]) -> bool:
+    """Whether the generated command is an idempotent read.
+
+    Generated args are ``<group> <operation> [flags]``; reads are the
+    ``*get``/``*list`` verbs (plus the ``contact lookup`` alias form) and carry
+    no ``--data`` body. Every other verb — sends, call placement, creates,
+    updates, deletes — is a non-idempotent write under the SAFE-RETRY rule, so
+    an unrecognized verb fails safe in the no-blind-retry direction.
+    """
+    if len(args) < 2 or "--data" in args:
+        return False
+    return args[1].rsplit(".", 1)[-1] in _READ_VERBS
 
 
 def _sms_send_payload(args: list[str]) -> dict[str, object] | None:
@@ -405,13 +423,17 @@ def run_generated_json(
 ) -> Any:
     """Run the generated CLI and return its parsed JSON stdout.
 
-    Retry rule: ``sms send`` is not idempotent, so a send retries only when
-    the failure provably left no accepted request (see http_retry's
-    SAFE-RETRY comment); any other generated command may retry on any
-    transient failure. Attempts are bounded by http_retry's shared policy.
+    Retry rule: a generated command that carries a request body or runs a
+    write verb is not idempotent, so it retries only when the failure
+    provably left no accepted request (see http_retry's SAFE-RETRY comment);
+    idempotent reads may retry on any transient failure. Attempts are
+    bounded by http_retry's shared policy.
     """
     cmd = ["--output", "json", *args]
-    is_send = _is_sms_send_command(args)
+    is_read = _is_read_command(args)
+    outcome_unknown_message = (
+        SEND_OUTCOME_UNKNOWN_MESSAGE if _is_sms_send_command(args) else REQUEST_OUTCOME_UNKNOWN_MESSAGE
+    )
 
     def _attempt() -> subprocess.CompletedProcess[str]:
         proc = run_generated(cmd, capture_output=True)
@@ -425,14 +447,14 @@ def run_generated_json(
                 retryable=False,
             )
         retry_after = http_retry.retry_after_in_text(message)
-        if is_send:
-            classification = http_retry.classify_send_stderr(message)
-            if classification == http_retry.SEND_SAFE_RETRY:
+        if not is_read:
+            classification = http_retry.classify_request_stderr(message)
+            if classification == http_retry.SAFE_RETRY:
                 raise _RetryableGeneratedError(message, retry_after=retry_after)
-            if classification == http_retry.SEND_PERMANENT:
+            if classification == http_retry.PERMANENT:
                 raise WrapperError(message, code="upstream_error", retryable=False)
             raise WrapperError(
-                f"{SEND_OUTCOME_UNKNOWN_MESSAGE}: {message}",
+                f"{outcome_unknown_message}: {message}",
                 code="send_outcome_unknown",
                 retryable=False,
             )
